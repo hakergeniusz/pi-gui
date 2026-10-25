@@ -1,10 +1,15 @@
 //! Non-blocking RPC bridge to the pi coding agent.
 //!
-//! A dedicated background thread owns the `pi --mode rpc` child process. The UI
-//! thread sends commands through a channel and receives responses through
-//! per-request oneshot channels. Async events are forwarded to a channel the
-//! UI thread polls via `glib::timeout_add`. This keeps the GTK main loop
-//! responsive.
+//! Two dedicated background threads own the `pi --mode rpc` child process:
+//! a writer that blocks on the command channel, and a reader that blocks on
+//! the child's stdout. The UI thread sends commands through a channel and
+//! receives responses through per-request oneshot channels; async events are
+//! forwarded to a channel the UI thread polls via `glib::timeout_add`. This
+//! keeps the GTK main loop responsive — and, critically, writing a command
+//! never waits for pi to produce output first: a single-threaded
+//! write-then-blocking-read loop starves queued commands whenever pi is idle
+//! and silent (e.g. a prompt typed after startup settles), which deadlocks
+//! the agent forever.
 //!
 //! Wire format (see pi's docs/rpc-commands.md and docs/json.md): commands and
 //! events are flat JSON objects with a `"type"` discriminator, e.g.
@@ -13,8 +18,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::process::{Child, Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 /// A command sent to the pi agent. Field names serialize to camelCase per the
@@ -225,7 +230,14 @@ fn apply_stdio(cmd: &mut Command) {
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 }
 
-/// Spawn the RPC background thread.
+/// Spawn the RPC bridge: child process plus dedicated writer and reader
+/// threads.
+///
+/// The writer blocks on `cmd_rx`, so a queued command is written to pi's stdin
+/// immediately regardless of whether pi has anything to say. The reader blocks
+/// on the child's stdout and routes response records (by id) and async events
+/// to their channels. Either thread exiting (broken pipe / pi exit) fails all
+/// pending requests and emits [`PiEvent::Disconnected`].
 pub fn spawn() -> Result<(PiRpcClient, PiEventStream), Box<dyn std::error::Error + Send + Sync>> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<RpcMsg>();
     let (event_tx, event_rx) = mpsc::channel::<PiEvent>();
@@ -236,22 +248,7 @@ pub fn spawn() -> Result<(PiRpcClient, PiEventStream), Box<dyn std::error::Error
     };
     let stream = PiEventStream { rx: event_rx };
 
-    let cli_path = resolve_pi_path();
-    thread::spawn(move || {
-        if let Err(err) = run_rpc_loop(&cli_path, cmd_rx, event_tx) {
-            eprintln!("[pi rpc] loop error: {err}");
-        }
-    });
-
-    Ok((client, stream))
-}
-
-fn run_rpc_loop(
-    cli_path: &str,
-    cmd_rx: mpsc::Receiver<RpcMsg>,
-    event_tx: mpsc::Sender<PiEvent>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut child = spawn_pi(cli_path)?;
+    let mut child = spawn_pi(&resolve_pi_path())?;
 
     let mut stdin = child.stdin.take().expect("failed to open stdin");
     let stdout = child.stdout.take().expect("failed to open stdout");
@@ -265,33 +262,53 @@ fn run_rpc_loop(
         }
     });
 
-    let mut reader = BufReader::new(stdout);
+    // Pending request id -> response sender, shared by both threads: the
+    // writer registers senders, the reader resolves them.
+    let pending: Arc<Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
-    // Pending request id -> response sender.
-    let mut pending: HashMap<String, mpsc::Sender<serde_json::Value>> = HashMap::new();
+    thread::spawn({
+        let pending = pending.clone();
+        move || run_writer(&mut stdin, cmd_rx, &pending)
+    });
 
-    loop {
-        let cmd = cmd_rx.try_recv().ok();
+    thread::spawn(move || run_reader(stdout, event_tx, &pending, child));
 
-        match cmd {
-            Some(RpcMsg::Command { id, command, tx }) => {
-                let mut value = serde_json::to_value(&command)
-                    .map_err(|e| format!("failed to serialize command: {e}"))?;
+    Ok((client, stream))
+}
+
+/// Write side of the bridge: serialize commands and push them into pi's stdin
+/// as soon as they arrive. Runs until the command channel closes or the pipe
+/// breaks.
+fn run_writer(
+    stdin: &mut std::process::ChildStdin,
+    cmd_rx: mpsc::Receiver<RpcMsg>,
+    pending: &Arc<Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>,
+) {
+    while let Ok(msg) = cmd_rx.recv() {
+        match msg {
+            RpcMsg::Command { id, command, tx } => {
+                let Ok(mut value) = serde_json::to_value(&command) else {
+                    let _ = tx.send(failure("failed to serialize command"));
+                    continue;
+                };
                 if let Some(map) = value.as_object_mut() {
                     map.insert("id".into(), serde_json::json!(id));
                 }
-                let line = serde_json::to_string(&value)
-                    .map_err(|e| format!("failed to serialize command: {e}"))?;
-                if let Err(err) = stdin.write_all(format!("{line}\n").as_bytes()) {
-                    let _ = tx.send(serde_json::json!({
-                        "success": false, "error": format!("failed to write to pi: {err}")
-                    }));
+                let Ok(line) = serde_json::to_string(&value) else {
+                    let _ = tx.send(failure("failed to serialize command"));
+                    continue;
+                };
+                let written = stdin
+                    .write_all(format!("{line}\n").as_bytes())
+                    .and_then(|_| stdin.flush());
+                if written.is_err() {
+                    let _ = tx.send(failure("failed to write to pi: pipe closed"));
                     break;
                 }
-                let _ = stdin.flush();
-                pending.insert(id, tx);
+                pending.lock().unwrap().insert(id, tx);
             }
-            Some(RpcMsg::ExtensionResponse { id, mut value }) => {
+            RpcMsg::ExtensionResponse { id, mut value } => {
                 let mut line_value =
                     serde_json::json!({ "type": "extension_ui_response", "id": id });
                 if let (Some(map), Some(val_map)) =
@@ -302,23 +319,36 @@ fn run_rpc_loop(
                     }
                 }
                 let line = serde_json::to_string(&line_value).unwrap();
-                let _ = stdin.write_all(format!("{line}\n").as_bytes());
-                let _ = stdin.flush();
+                if stdin.write_all(format!("{line}\n").as_bytes()).and_then(|_| stdin.flush()).is_err()
+                {
+                    break;
+                }
             }
-            None => {}
         }
+    }
+}
 
+/// Read side of the bridge: parse stdout lines, resolve pending command
+/// responses by id, and forward session events. Exits when pi closes stdout;
+/// then fails all pending requests, notifies the UI, and reaps the child.
+fn run_reader(
+    stdout: std::process::ChildStdout,
+    event_tx: mpsc::Sender<PiEvent>,
+    pending: &Arc<Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>,
+    mut child: Child,
+) {
+    let mut reader = BufReader::new(stdout);
+
+    loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
             Ok(0) => {
                 eprintln!("[pi rpc] pi process exited (stdout closed)");
-                let _ = event_tx.send(PiEvent::Disconnected);
                 break;
             }
             Ok(_) => {}
             Err(err) => {
                 eprintln!("[pi rpc] read error: {err}");
-                let _ = event_tx.send(PiEvent::Disconnected);
                 break;
             }
         }
@@ -338,7 +368,7 @@ fn run_rpc_loop(
 
         // Correlate command responses by id.
         if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
-            if let Some(tx) = pending.remove(id) {
+            if let Some(tx) = pending.lock().unwrap().remove(id) {
                 let _ = tx.send(value.clone());
                 continue;
             }
@@ -354,12 +384,17 @@ fn run_rpc_loop(
         }
     }
 
-    for (_, tx) in pending.drain() {
-        let _ = tx.send(serde_json::json!({ "success": false, "error": "rpc process exited" }));
+    for (_, tx) in pending.lock().unwrap().drain() {
+        let _ = tx.send(failure("rpc process exited"));
     }
 
+    let _ = event_tx.send(PiEvent::Disconnected);
     let _ = child.kill();
-    Ok(())
+    let _ = child.wait();
+}
+
+fn failure(error: &str) -> serde_json::Value {
+    serde_json::json!({ "success": false, "error": error })
 }
 
 #[cfg(test)]
@@ -446,5 +481,63 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(ev, PiEvent::Response { .. }));
+    }
+
+    /// Regression test for the write-starvation deadlock: with the real pi
+    /// child idle and silent (all extension startup chatter drained), two
+    /// back-to-back commands — the exact sequence `on_send_message` produces —
+    /// must both reach pi. The old single-threaded loop blocked in
+    /// `read_line` after the first write and the prompt was never delivered,
+    /// hanging the UI on "Working…" forever.
+    #[test]
+    fn commands_reach_idle_pi_without_waiting_for_output() {
+        let (client, stream) = spawn().expect("failed to spawn pi RPC bridge");
+
+        // Wait for pi to finish booting (zsh wrapper + extension loading can
+        // take a few seconds) by polling get_state until it succeeds.
+        let mut booted = false;
+        for _ in 0..60 {
+            let rx = client.send(PiCommand::GetState);
+            if let Ok(v) = rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                if v.get("success").and_then(|s| s.as_bool()) == Some(true) {
+                    booted = true;
+                    break;
+                }
+            }
+        }
+        assert!(booted, "pi did not answer get_state within timeout");
+
+        // Drain events and let pi go quiet: once the startup and get_state
+        // chatter ends, nothing else will wake a blocking reader.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            while stream.try_event().is_some() {}
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        while stream.try_event().is_some() {}
+
+        // The deadlock trigger: two commands queued while pi is silent.
+        let _name_rx = client.send(PiCommand::SetSessionName { name: "bridge test".into() });
+        let _prompt_rx = client.send(PiCommand::Prompt {
+            message: "Reply with exactly: bridge ok".into(),
+        });
+
+        // The prompt must start the agent even though pi produced no output
+        // between the two sends.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut started = false;
+        let mut settled = false;
+        while std::time::Instant::now() < deadline && !settled {
+            while let Some(event) = stream.try_event() {
+                match event {
+                    PiEvent::AgentStart => started = true,
+                    PiEvent::AgentSettled { .. } => settled = true,
+                    _ => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(started, "agent_start never arrived — prompt starved behind a blocking read");
+        assert!(settled, "agent never settled — run did not complete");
     }
 }

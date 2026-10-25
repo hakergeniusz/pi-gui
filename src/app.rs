@@ -21,7 +21,7 @@ use libadwaita::{
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 type Value = serde_json::Value;
 
@@ -679,21 +679,24 @@ impl State {
         if let Some(recv) = self.pending_models.take() {
             match recv.try_recv() {
                 Ok(value) => self.load_models_done(&value),
-                Err(_) => self.pending_models = Some(recv),
+                Err(TryRecvError::Empty) => self.pending_models = Some(recv),
+                Err(TryRecvError::Disconnected) => self.show_toast("Model list unavailable"),
             }
         }
 
         if let Some((recv, after_new)) = self.pending_state.take() {
             match recv.try_recv() {
                 Ok(value) => self.load_state_done(&value, after_new),
-                Err(_) => self.pending_state = Some((recv, after_new)),
+                Err(TryRecvError::Empty) => self.pending_state = Some((recv, after_new)),
+                Err(TryRecvError::Disconnected) => self.show_toast("State sync failed"),
             }
         }
 
         if let Some(recv) = self.pending_levels.take() {
             match recv.try_recv() {
                 Ok(value) => self.load_levels_done(&value),
-                Err(_) => self.pending_levels = Some(recv),
+                Err(TryRecvError::Empty) => self.pending_levels = Some(recv),
+                Err(TryRecvError::Disconnected) => {}
             }
         }
 
@@ -715,7 +718,10 @@ impl State {
                             Some((self.rpc.send(PiCommand::GetState), true));
                     }
                 }
-                Err(_) => self.pending = Pending::NewSession(recv),
+                Err(TryRecvError::Empty) => self.pending = Pending::NewSession(recv),
+                Err(TryRecvError::Disconnected) => {
+                    self.show_toast("Failed to start a new chat — RPC bridge died")
+                }
             },
             Pending::Prompt(recv) => match recv.try_recv() {
                 Ok(value) => {
@@ -732,7 +738,14 @@ impl State {
                         self.finalize_streaming(None, None);
                     }
                 }
-                Err(_) => self.pending = Pending::Prompt(recv),
+                Err(TryRecvError::Empty) => self.pending = Pending::Prompt(recv),
+                Err(TryRecvError::Disconnected) => {
+                    self.show_toast("Prompt failed — RPC bridge died");
+                    self.busy = false;
+                    self.stop_button.set_sensitive(false);
+                    self.subtitle_label.set_label("Idle");
+                    self.finalize_streaming(None, None);
+                }
             },
             Pending::SwitchSession(recv) => match recv.try_recv() {
                 Ok(value) => {
@@ -747,11 +760,15 @@ impl State {
                         self.show_toast("Session switch cancelled");
                     }
                 }
-                Err(_) => self.pending = Pending::SwitchSession(recv),
+                Err(TryRecvError::Empty) => self.pending = Pending::SwitchSession(recv),
+                Err(TryRecvError::Disconnected) => {
+                    self.show_toast("Session switch failed — RPC bridge died")
+                }
             },
             Pending::GetMessages(recv) => match recv.try_recv() {
                 Ok(value) => self.load_history_done(&value),
-                Err(_) => self.pending = Pending::GetMessages(recv),
+                Err(TryRecvError::Empty) => self.pending = Pending::GetMessages(recv),
+                Err(TryRecvError::Disconnected) => {}
             },
         }
     }
