@@ -303,14 +303,19 @@ fn run_writer(
                     let _ = tx.send(failure("failed to serialize command"));
                     continue;
                 };
+                // Register the response sender BEFORE writing: run_reader drops
+                // replies whose id is not in the map, so a fast reply could
+                // otherwise arrive between the write and the insert and be lost.
+                pending.lock().unwrap().insert(id.clone(), tx);
                 let written = stdin
                     .write_all(format!("{line}\n").as_bytes())
                     .and_then(|_| stdin.flush());
                 if written.is_err() {
-                    let _ = tx.send(failure("failed to write to pi: pipe closed"));
+                    if let Some(tx) = pending.lock().unwrap().remove(&id) {
+                        let _ = tx.send(failure("failed to write to pi: pipe closed"));
+                    }
                     break;
                 }
-                pending.lock().unwrap().insert(id, tx);
             }
             RpcMsg::ExtensionResponse { id, mut value } => {
                 let mut line_value =
