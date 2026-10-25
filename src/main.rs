@@ -4,13 +4,10 @@ mod rpc;
 mod session_list;
 mod style;
 
-use gtk4::{Application};
-use gtk4::prelude::*;
+use libadwaita::Application;
+use libadwaita::prelude::*;
 
 fn main() {
-    // Initialize libadwaita (loads the Adwaita theme, sets GNOME defaults).
-    libadwaita::init().expect("failed to initialize libadwaita");
-
     let app = Application::builder()
         .application_id("io.github.hakergeniusz.pi-gui")
         .build();

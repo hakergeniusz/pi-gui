@@ -2,18 +2,18 @@
 
 A native GNOME GUI for the [pi coding agent](https://github.com/earendil-works/pi), built in **Rust** with **GTK4 + libadwaita** following the latest GNOME Human Interface Guidelines.
 
-Modeled on Claude Desktop / ChatGPT Desktop: a sidebar session list, header bar, message bubbles, and a bottom input area.
+Modeled on Claude Desktop / ChatGPT Desktop: a sidebar session list, header bar, chat transcript, and a rounded bottom input bar.
 
 ## How it works
 
 `pi` ships with an **RPC mode** (`pi --mode rpc`) that speaks a JSONL protocol over stdin/stdout. This GUI spawns `pi` as a child process on a background thread and drives it from the GTK main loop (`glib::timeout_add_local` polls events every 50 ms), so the UI never blocks while the agent streams responses.
 
-- `src/rpc.rs` — non-blocking RPC bridge (child process + JSONL command/response correlation + async event fan-out).
-- `src/app.rs` — main window, sidebar session list, header bar, chat page, input, preferences, extension-dialog handling (confirm/input/editor/select/notify).
-- `src/chat.rs` — user/assistant message bubbles, streaming bubble with live thinking text, tool-call blocks, scrollable transcript.
-- `src/session_list.rs` — sidebar session list with active-row highlighting.
-- `src/style.rs` — Adwaita-driven CSS (accent-color user bubbles, card-surface assistant bubbles, rounded input, toasts).
-- `src/main.rs` — libadwaita GTK4 application entry point.
+- `src/rpc.rs` — non-blocking RPC bridge (writer + reader threads, child process, JSONL command/response correlation, async event fan-out).
+- `src/app.rs` — main window, sidebar session list, header bar, chat page, multiline input, preferences, extension-dialog handling (confirm/input/editor/select/notify).
+- `src/chat.rs` — chat transcript widgets: right-aligned user bubbles, avatar + timestamp assistant rows, collapsible reasoning, tool-run cards, streaming row.
+- `src/session_list.rs` — sidebar session list (icon + title + date, rounded selection pills).
+- `src/style.rs` — CSS on libadwaita's palette variables (follows light/dark style and your accent color).
+- `src/main.rs` — libadwaita application entry point.
 
 ## Environment & secrets
 
@@ -28,15 +28,18 @@ Escape hatches:
 
 ## Features
 
-- Native Adwaita theme & GNOME HIG styling (sidebar, header bar, suggested-action/destructive buttons, toasts)
-- Welcome page + sidebar with the 40 most recent sessions from pi's store (`~/.pi/agent/sessions`), named like pi's own `/resume` picker; clicking one loads its history (`switch_session` + `get_messages`)
+- Native Adwaita theme & GNOME HIG styling; all colors derive from libadwaita's palette, so light/dark style and your accent color are followed automatically
+- Welcome page + sidebar with the 40 most recent sessions from pi's store (`~/.pi/agent/sessions`), named like pi's own `/resume` picker, with date labels; clicking one loads its history (`switch_session` + `get_messages`)
 - New chats are named automatically from your first message (`set_session_name`)
-- Streaming assistant responses with dimmed live thinking text and a typing indicator; final answer replaces the stream when the message completes
-- Tool-call blocks rendered inline, with error state
-- **Model dropdown + search box** in the header bar: all models from `get_available_models` (853 across 9 providers here), filtered as you type; selecting one sends `set_model`; the active model is selected on startup from `get_state`
+- Chat transcript in the Claude/ChatGPT-desktop style: right-aligned tinted user bubbles, assistant messages with a π avatar, name and timestamp, selectable text
+- Reasoning ("thinking") shown as a collapsible **Reasoning** block — live-expanded while streaming, auto-collapsed when the answer starts; rendered for history too
+- Tool runs as cards: icon + tool name + argument summary in the header, monospace result body, expanded while running and collapsed (click to reopen) when done, error state on failure
+- Streaming assistant responses with a "Thinking…" indicator that disappears once text arrives
+- **Model dropdown with built-in search** in the header bar (click and type): all models from `get_available_models` (853 across 9 providers here); selecting one sends `set_model`; the active model is selected on startup from `get_state`
+- **Multiline input bar**: Enter sends, Shift+Enter inserts a newline; the bar grows with the text up to ~7 lines
 - Sending while the agent is running queues a **steering message** (delivered after the current turn) instead of erroring
 - Preferences window: thinking level (from `get_available_thinking_levels`) and auto-compact toggle — both wired to pi
-- Extension UI dialogs (confirm / input / multi-line editor / select / notify toasts); fire-and-forget methods (`setStatus`, …) are ignored without responding
+- Extension UI dialogs (confirm / input / multi-line editor / select / notify toasts); fire-and-forget methods (`setStatus`, …) are ignored without responding; toast text is markup-escaped
 - Stop (abort) button while the agent is running; auto-retry toasts on transient provider errors
 - Clear handling when the pi child dies: input disabled and a "pi exited" toast, instead of a silently dead UI
 
@@ -48,7 +51,7 @@ cargo build          # debug
 cargo run            # launch the GUI
 cargo build --release
 cargo run --release  # launch release build
-cargo test           # RPC wire-format serde tests
+cargo test           # RPC wire-format serde tests + an end-to-end deadlock regression test against the real pi
 ```
 
 Requires GTK4, libadwaita, Gdk4, and Pango development files (all present on Arch Linux). `pi` must be installed (`~/.pi/agent/bin/pi` is picked up automatically even if not on PATH).

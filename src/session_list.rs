@@ -1,7 +1,8 @@
-//! Sidebar session list following GNOME HIG sidebar patterns.
+//! Sidebar session list following GNOME HIG sidebar patterns: rounded
+//! selection pills, icon + title + dim date subtitle per row.
 
 use gtk4::prelude::*;
-use gtk4::{Align, Box, Button, Label, Orientation, ScrolledWindow};
+use gtk4::{Align, Box, Button, Image, Label, Orientation, ScrolledWindow};
 use pango::EllipsizeMode;
 
 use std::cell::RefCell;
@@ -11,12 +12,14 @@ use std::rc::Rc;
 #[derive(Clone)]
 pub struct SessionRow {
     pub button: Button,
-    pub title: Label,
-    pub id: String,
+    title: Label,
+    #[allow(dead_code)] // kept so the row can update its date label later
+    subtitle: Label,
+    id: String,
 }
 
 impl SessionRow {
-    pub fn new(id: &str, name: &str) -> Self {
+    pub fn new(id: &str, name: &str, subtitle: &str) -> Self {
         let button = Button::builder()
             .hexpand(true)
             .valign(Align::Center)
@@ -27,18 +30,22 @@ impl SessionRow {
         let row = Box::builder()
             .orientation(Orientation::Horizontal)
             .hexpand(true)
-            .spacing(8)
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(6)
-            .margin_bottom(6)
+            .spacing(10)
             .build();
 
-        let icon = gtk4::Image::builder()
-            .icon_name("document-symbolic")
+        let icon = Image::builder()
+            .icon_name("text-x-generic-symbolic")
             .pixel_size(16)
+            .valign(Align::Start)
+            .margin_top(2)
             .build();
-        icon.add_css_class("dim-label");
+        icon.add_css_class("session-icon");
+
+        let texts = Box::builder()
+            .orientation(Orientation::Vertical)
+            .hexpand(true)
+            .spacing(1)
+            .build();
 
         let title = Label::builder()
             .label(name)
@@ -48,13 +55,25 @@ impl SessionRow {
             .build();
         title.add_css_class("session-title");
 
+        let subtitle = Label::builder()
+            .label(subtitle)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(EllipsizeMode::End)
+            .build();
+        subtitle.add_css_class("session-subtitle");
+
+        texts.append(&title);
+        texts.append(&subtitle);
+
         row.append(&icon);
-        row.append(&title);
+        row.append(&texts);
         button.set_child(Some(&row));
 
         Self {
             button,
             title,
+            subtitle,
             id: id.to_string(),
         }
     }
@@ -62,18 +81,16 @@ impl SessionRow {
     pub fn set_active(&self, active: bool) {
         if active {
             self.button.add_css_class("active");
-            self.button.add_css_class("suggested-action");
         } else {
             self.button.remove_css_class("active");
-            self.button.remove_css_class("suggested-action");
         }
     }
 }
 
-/// The sidebar containing the session list and a "new session" button.
+/// The sidebar containing the session list.
 pub struct SessionList {
     pub scrolled: ScrolledWindow,
-    pub list: Box,
+    list: Box,
     rows: RefCell<Vec<SessionRow>>,
     on_selected: RefCell<Option<Rc<dyn Fn(&str)>>>,
 }
@@ -112,14 +129,13 @@ impl SessionList {
     }
 
     /// Add a session row; `at_top` prepends it (new chats) instead of
-    /// appending (initial list population). Returns the (possibly existing)
-    /// row for an already-present id after renaming it.
-    pub fn add_session(&self, id: &str, name: &str, at_top: bool) -> SessionRow {
+    /// appending (initial list population). An already-present id is renamed.
+    pub fn add_session(&self, id: &str, name: &str, subtitle: &str, at_top: bool) -> SessionRow {
         if let Some(row) = self.rows.borrow().iter().find(|r| r.id == id).cloned() {
             row.title.set_label(name);
             return row;
         }
-        let row = SessionRow::new(id, name);
+        let row = SessionRow::new(id, name, subtitle);
         if let Some(cb) = self.on_selected.borrow().clone() {
             let cb = cb.clone();
             let id = row.id.clone();

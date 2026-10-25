@@ -70,7 +70,11 @@ pub enum PiEvent {
     },
     MessageEnd { message: Option<serde_json::Value> },
     #[serde(rename_all = "camelCase")]
-    ToolExecutionStart { tool_call_id: Option<String>, tool_name: Option<String> },
+    ToolExecutionStart {
+        tool_call_id: Option<String>,
+        tool_name: Option<String>,
+        args: Option<serde_json::Value>,
+    },
     #[serde(rename_all = "camelCase")]
     ToolExecutionUpdate {
         tool_call_id: Option<String>,
@@ -449,7 +453,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             ev,
-            PiEvent::ToolExecutionStart { tool_call_id: Some(ref id), tool_name: Some(ref n) }
+            PiEvent::ToolExecutionStart { tool_call_id: Some(ref id), tool_name: Some(ref n), .. }
                 if id == "c1" && n == "bash"
         ));
 

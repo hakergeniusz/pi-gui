@@ -1,193 +1,237 @@
-//! GNOME HIG / Adwaita-inspired CSS for the pi GUI.
-//! Loaded into the application's default style provider on startup.
+//! GNOME HIG / libadwaita CSS for the pi GUI.
+//!
+//! All colors come from libadwaita's palette variables (@window_bg_color,
+//! @view_bg_color, @card_bg_color, @accent_color, …) so light/dark style and
+//! the user's accent color are followed automatically.
 
 use gtk4::CssProvider;
 use gdk4::Display;
 
-const CSS: &str = r#"/* 
-* {
-    -gtk-icon-shadow: none;
-    -gtk-icon-style: regular;
-}
-
+const CSS: &str = r#"
+/* ================= Base ================= */
 window {
-    background-color: @theme_bg_color;
+    background-color: @window_bg_color;
 }
 
-/* ---------- Header ---------- */
-.title {
-    font-weight: 600;
-    font-size: 1.15em;
-    color: @theme_fg_color;
-}
-
-.subtitle {
-    font-size: 0.9em;
-    color: @theme_fg_color;
-    opacity: 0.7;
-}
-
-/* pill buttons in header / welcome */
-.pill {
-    border-radius: 1000px;
-    padding: 6px 12px;
-}
-
-/* ---------- Sidebar ---------- */
+/* ================= Sidebar ================= */
 .sidebar {
-    background-color: @theme_sidebar_bg_color;
+    background-color: @sidebar_bg_color;
+}
+
+.sidebar-scroll {
+    background-color: transparent;
 }
 
 .session-list {
-    padding-top: 6px;
+    padding: 2px 6px 12px;
 }
 
 .session-row {
-    border-radius: 6px;
-    margin: 2px 8px;
+    border-radius: 8px;
+    padding: 8px 10px;
 }
 
 .session-row:hover {
-    background-color: shade(@theme_sidebar_bg_color, 1.1);
+    background-color: alpha(@sidebar_fg_color, 0.07);
 }
 
 .session-row.active {
-    background-color: @theme_selected_bg_color;
-    color: @theme_selected_fg_color;
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
 }
 
-.session-row.active .dim-label {
+.session-row.active .session-icon {
+    color: @accent_fg_color;
+    opacity: 1;
+}
+
+.session-title {
+    font-weight: 500;
+}
+
+.session-subtitle {
+    font-size: 0.82em;
+    opacity: 0.55;
+}
+
+.session-row.active .session-subtitle {
     opacity: 0.8;
 }
 
-.session-row.new-chat-row {
-    font-weight: 500;
-    margin-top: 8px;
+.new-chat-row {
+    border-radius: 999px;
+    padding: 10px 16px;
+    font-weight: 600;
+    margin: 10px 8px 6px;
 }
 
-.sidebar-separator {
-    margin: 0;
-}
-
-/* ---------- Chat ---------- */
-.chat-page {
-    background-color: @theme_bg_color;
-}
-
+/* ================= Chat transcript ================= */
 .chat-scroll {
-    background-color: @theme_base_color;
+    background-color: @view_bg_color;
 }
 
 .chat-list {
-    padding-top: 8px;
+    padding: 16px 20px 6px;
 }
 
-/* message bubbles */
-.bubble {
+/* --- user message: right-aligned tinted bubble --- */
+.user-row {
+    margin-top: 14px;
+}
+
+.bubble-user {
+    background-color: alpha(@accent_color, 0.16);
+    border-radius: 14px 14px 4px 14px;
+    padding: 9px 14px;
+}
+
+.msg-time {
+    font-size: 0.75em;
+    opacity: 0.5;
+}
+
+/* --- assistant message: avatar + name + plain text --- */
+.assistant-row {
+    margin-top: 14px;
+}
+
+.avatar {
+    border-radius: 999px;
+    background-color: alpha(@accent_color, 0.16);
+    color: @accent_color;
+}
+
+.avatar-label {
+    font-weight: 700;
+}
+
+.assistant-name {
+    font-weight: 700;
+}
+
+.message-text {
+    line-height: 1.45;
+}
+
+/* --- streaming status --- */
+.stream-status {
+    color: alpha(@view_fg_color, 0.55);
+    font-size: 0.9em;
+}
+
+/* --- collapsible reasoning --- */
+.reasoning-toggle {
+    border-radius: 8px;
+    padding: 5px 10px;
+    margin-top: 2px;
+}
+
+.reasoning-toggle:hover {
+    background-color: alpha(@view_fg_color, 0.06);
+}
+
+.reasoning-toggle-label {
+    font-size: 0.86em;
+    font-weight: 600;
+    color: alpha(@view_fg_color, 0.6);
+}
+
+.reasoning-body {
+    color: alpha(@view_fg_color, 0.55);
+    font-style: italic;
+    font-size: 0.9em;
+    line-height: 1.4;
+}
+
+/* ================= Tool cards ================= */
+.tool-card {
+    background-color: @card_bg_color;
+    border: 1px solid alpha(@window_fg_color, 0.11);
+    border-radius: 12px;
+}
+
+.tool-card.tool-error {
+    border-color: alpha(@error_color, 0.55);
+}
+
+.tool-header-btn {
     border-radius: 12px;
     padding: 8px 12px;
 }
 
-.bubble.user {
-    background-color: @theme_selected_bg_color;
-    color: @theme_selected_fg_color;
-}
-
-.bubble.assistant {
-    background-color: shade(@theme_base_color, 1.05);
-    border: 1px solid alpha(@theme_border_color, 0.3);
-    color: @theme_fg_color;
-}
-
-.bubble.streaming {
-    background-color: shade(@theme_base_color, 1.04);
-    border: 1px solid alpha(@theme_border_color, 0.2);
-}
-
-.message-text {
-    line-height: 1.4;
-}
-
-/* assistant reasoning, shown dimmed above the answer */
-.thinking-text {
-    line-height: 1.4;
-    opacity: 0.55;
-    font-style: italic;
-    font-size: 0.92em;
-}
-
-/* tool call blocks */
-.tool-block {
-    border-radius: 8px;
-    background-color: alpha(@theme_fg_color, 0.05);
-    margin: 4px 0;
-}
-
-.tool-header {
-    font-size: 0.85em;
-    opacity: 0.65;
-}
-
-.tool-title {
-    font-weight: 500;
-}
-
-.tool-title.tool-error {
-    color: @error_color;
-}
-
-.tool-content {
-    margin-top: 4px;
-}
-
-.tool-text {
+.tool-name {
+    font-weight: 600;
     font-size: 0.9em;
-    line-height: 1.45;
 }
 
-/* ---------- Input ---------- */
-.input-frame {
-    margin: 0;
-    box-shadow: none;
+.tool-summary {
+    font-size: 0.85em;
+    opacity: 0.55;
 }
 
-.chat-input {
-    border-radius: 1000px;
-    padding: 8px 14px;
-    font-size: 0.95em;
-    background-color: @theme_input_bg_color;
-    border: 1px solid alpha(@theme_border_color, 0.5);
-}
-
-.chat-input:focus {
-    border: 1px solid @theme_fg_color;
-}
-
-/* ---------- Welcome ---------- */
-.welcome-icon {
+.tool-status-icon {
     opacity: 0.5;
 }
 
+.tool-status-icon.tool-error {
+    color: @error_color;
+    opacity: 1;
+}
+
+.tool-body {
+    padding: 0 12px 10px;
+}
+
+.tool-text {
+    font-size: 0.85em;
+    line-height: 1.45;
+    color: alpha(@view_fg_color, 0.8);
+}
+
+/* ================= Input bar ================= */
+.input-card {
+    background-color: @card_bg_color;
+    border: 1px solid alpha(@window_fg_color, 0.11);
+    border-radius: 16px;
+    padding: 6px 6px 6px 4px;
+    margin: 6px 16px 16px;
+}
+
+.input-card:focus-within {
+    border-color: alpha(@accent_color, 0.55);
+}
+
+.input-textview {
+    background-color: transparent;
+    color: @view_fg_color;
+    font-size: 0.98em;
+}
+
+.input-placeholder {
+    color: alpha(@view_fg_color, 0.4);
+    font-size: 0.98em;
+}
+
+/* ================= Welcome ================= */
+.welcome-avatar {
+    border-radius: 999px;
+    background-color: alpha(@accent_color, 0.14);
+    color: @accent_color;
+}
+
+.welcome-avatar-label {
+    font-size: 2.6em;
+    font-weight: 700;
+}
+
 .welcome-title {
-    font-weight: 600;
-    font-size: 1.5em;
-    color: @theme_fg_color;
+    font-weight: 800;
+    font-size: 1.9em;
 }
 
 .welcome-subtitle {
-    font-size: 1.05em;
-    color: @theme_fg_color;
-    opacity: 0.7;
-}
-
-/* dim label */
-.dim-label {
-    opacity: 0.6;
-}
-
-/* ---------- toasts ---------- */
-toast {
-    border-radius: 6px;
+    font-size: 1.02em;
+    opacity: 0.65;
 }
 "#;
 

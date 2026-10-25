@@ -10,13 +10,14 @@ use crate::rpc::{PiCommand, PiEvent, PiEventStream, PiRpcClient};
 use crate::session_list::SessionList;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box, Button, DropDown, Entry, Frame, HeaderBar, Image, Label, ListBox, ListBoxRow,
-    Orientation, ScrolledWindow, Separator, StringList, Stack, TextView, Widget,
+    Align, Box, Button, DropDown, Entry, EventControllerKey, Image, Label, ListBox, ListBoxRow,
+    Orientation, Overlay, PropertyExpression, ScrolledWindow, Separator, StringList, Stack,
+    TextView, Widget,
 };
 use libadwaita::prelude::*;
 use libadwaita::{
-    ComboRow, MessageDialog, PreferencesGroup, PreferencesPage, PreferencesWindow, SwitchRow,
-    Toast,
+    ComboRow, HeaderBar, MessageDialog, PreferencesGroup, PreferencesPage, PreferencesWindow,
+    SwitchRow, Toast, WindowTitle,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -68,15 +69,16 @@ struct State {
     chat_view: ChatView,
     session_list: SessionList,
 
-    title_label: Label,
-    subtitle_label: Label,
+    window_title: WindowTitle,
     model_dropdown: DropDown,
 
     all_models: Vec<ModelInfo>,
     filtered_models: Vec<ModelInfo>,
     current_model_label: Option<String>,
 
-    input_entry: Entry,
+    input_view: TextView,
+    input_buffer: gtk4::TextBuffer,
+    input_placeholder: Label,
     send_button: Button,
     stop_button: Button,
 
@@ -94,7 +96,7 @@ struct State {
     session_named: bool,
 
     current_session_file: Option<String>,
-    sessions: Vec<(String, String)>, // (file path, display name)
+    sessions: Vec<(String, String, String)>, // (file path, display name, time label)
 
     suppress_model_signal: Rc<Cell<bool>>,
     suppress_thinking_signal: Rc<Cell<bool>>,
@@ -112,7 +114,7 @@ pub struct PiWindow {
 }
 
 impl PiWindow {
-    pub fn new(app: &gtk4::Application) -> Self {
+    pub fn new(app: &libadwaita::Application) -> Self {
         let (rpc, events) = crate::rpc::spawn().expect("failed to start pi RPC");
 
         let window = gtk4::ApplicationWindow::builder()
@@ -124,51 +126,21 @@ impl PiWindow {
         // ================= Header bar =================
         let header = HeaderBar::new();
 
-        let title_box = Box::builder()
-            .orientation(Orientation::Vertical)
-            .spacing(2)
-            .margin_start(6)
-            .build();
-
-        let title_label = Label::builder()
-            .label("pi coding agent")
-            .halign(Align::Start)
-            .hexpand(false)
-            .build();
-        title_label.add_css_class("title");
-
-        let subtitle_label = Label::builder()
-            .label("GNOME AI coding assistant")
-            .halign(Align::Start)
-            .hexpand(false)
-            .build();
-        subtitle_label.add_css_class("subtitle");
-
-        title_box.append(&title_label);
-        title_box.append(&subtitle_label);
-        header.set_title_widget(Some(&title_box));
+        let window_title = WindowTitle::new("pi", "coding agent");
 
         // New chat button (start of header)
         let new_chat_btn = Button::builder()
             .icon_name("document-new-symbolic")
-            .css_classes(["flat", "pill"])
+            .css_classes(["flat"])
             .valign(Align::Center)
             .build();
         new_chat_btn.set_tooltip_text(Some("New chat"));
         header.pack_start(&new_chat_btn);
 
-        // Model search (end)
-        let model_search_entry = Entry::builder()
-            .placeholder_text("Search models…")
-            .hexpand(false)
-            .valign(Align::Center)
-            .width_request(170)
-            .build();
-        model_search_entry.add_css_class("model-search");
-        model_search_entry.set_tooltip_text(Some("Filter models"));
-        header.pack_end(&model_search_entry);
+        window_title.set_subtitle("GNOME AI coding assistant");
+        header.set_title_widget(Some(&window_title));
 
-        // Model dropdown (end)
+        // Model dropdown (end): searchable in-place over all providers.
         let model_list = StringList::new(&["Loading models…"]);
         let model_dropdown = DropDown::builder()
             .model(&model_list)
@@ -176,6 +148,13 @@ impl PiWindow {
             .valign(Align::Center)
             .build();
         model_dropdown.set_tooltip_text(Some("Model"));
+        model_dropdown.set_enable_search(true);
+        let expression = PropertyExpression::new(
+            gtk4::StringObject::static_type(),
+            None::<&gtk4::Expression>,
+            "string",
+        );
+        model_dropdown.set_expression(Some(&expression));
         header.pack_end(&model_dropdown);
 
         // Settings button (end)
@@ -230,23 +209,21 @@ impl PiWindow {
             .vexpand(true)
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vscrollbar_policy(gtk4::PolicyType::Automatic)
-            .width_request(260)
+            .width_request(280)
             .build();
         sidebar_scrolled.add_css_class("sidebar");
 
         let session_list = SessionList::new();
 
         let new_chat_row = Button::builder()
-            .label("New chat")
-            .icon_name("document-new-symbolic")
             .hexpand(true)
-            .halign(Align::Start)
-            .css_classes(["flat", "session-row", "new-chat-row"])
-            .margin_top(10)
-            .margin_bottom(6)
-            .margin_start(12)
-            .margin_end(12)
+            .halign(Align::Fill)
+            .css_classes(["suggested-action", "pill", "new-chat-row"])
             .build();
+        new_chat_row.set_child(Some(&icon_label_box(
+            "document-new-symbolic",
+            "New chat",
+        )));
 
         let sidebar_inner = Box::builder()
             .orientation(Orientation::Vertical)
@@ -279,49 +256,67 @@ impl PiWindow {
         let chat_view = ChatView::new();
         chat_page.append(&chat_view.scrolled);
 
-        // Input area
-        let input_frame = Frame::builder()
-            .hexpand(true)
-            .css_classes(["input-frame"])
-            .build();
-
-        let input_box = Box::builder()
+        // Input area: rounded card with a multiline entry, circular send and
+        // stop buttons. Enter sends, Shift+Enter inserts a newline.
+        let input_card = Box::builder()
             .orientation(Orientation::Horizontal)
             .spacing(8)
-            .margin_top(10)
-            .margin_bottom(10)
-            .margin_start(14)
-            .margin_end(14)
+            .hexpand(true)
+            .css_classes(["input-card"])
             .build();
 
-        let input_entry = Entry::builder()
-            .placeholder_text("Ask pi to write, explain, or fix code…")
+        let input_scrolled = ScrolledWindow::builder()
             .hexpand(true)
-            .valign(Align::Center)
+            .vexpand(false)
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .propagate_natural_height(true)
+            .max_content_height(180)
             .build();
-        input_entry.add_css_class("chat-input");
+
+        let input_view = TextView::builder()
+            .wrap_mode(gtk4::WrapMode::WordChar)
+            .css_classes(["input-textview"])
+            .top_margin(11)
+            .bottom_margin(11)
+            .build();
+        let input_buffer = input_view.buffer();
+
+        input_scrolled.set_child(Some(&input_view));
+
+        // TextView has no placeholder support: overlay a dim label shown while
+        // the buffer is empty.
+        let input_overlay = Overlay::builder().child(&input_scrolled).build();
+        let input_placeholder = Label::builder()
+            .label("Ask pi to write, explain, or fix code…")
+            .halign(Align::Start)
+            .valign(Align::Start)
+            .margin_top(11)
+            .margin_start(2)
+            .build();
+        input_placeholder.add_css_class("input-placeholder");
+        input_overlay.add_overlay(&input_placeholder);
 
         let send_button = Button::builder()
-            .label("Send")
-            .icon_name("send-symbolic")
-            .css_classes(["suggested-action"])
+            .icon_name("document-send-symbolic")
+            .css_classes(["circular", "suggested-action"])
             .valign(Align::Center)
             .build();
         send_button.set_sensitive(false);
+        send_button.set_tooltip_text(Some("Send"));
 
         let stop_button = Button::builder()
             .icon_name("process-stop-symbolic")
-            .css_classes(["destructive-action"])
+            .css_classes(["circular", "destructive-action"])
             .valign(Align::Center)
             .build();
         stop_button.set_sensitive(false);
         stop_button.set_tooltip_text(Some("Stop"));
 
-        input_box.append(&input_entry);
-        input_box.append(&stop_button);
-        input_box.append(&send_button);
-        input_frame.set_child(Some(&input_box));
-        chat_page.append(&input_frame);
+        input_card.append(&input_overlay);
+        input_card.append(&stop_button);
+        input_card.append(&send_button);
+        chat_page.append(&input_card);
 
         stack.add_titled(&chat_page, Some("chat"), "Chat");
 
@@ -347,13 +342,14 @@ impl PiWindow {
             stack,
             chat_view,
             session_list,
-            title_label,
-            subtitle_label,
+            window_title,
             model_dropdown,
             all_models: Vec::new(),
             filtered_models: Vec::new(),
             current_model_label: None,
-            input_entry,
+            input_view,
+            input_buffer,
+            input_placeholder,
             send_button,
             stop_button,
             streaming: None,
@@ -387,22 +383,33 @@ impl PiWindow {
         new_chat_row.connect_clicked(move |_| s.borrow_mut().on_new_chat());
 
         let s = state.clone();
-        let entry = s.borrow().input_entry.clone();
-        entry.connect_activate(move |_| s.borrow_mut().on_send_message());
+        let entry_view = s.borrow().input_view.clone();
+        let key = EventControllerKey::new();
+        key.connect_key_pressed(move |_, keyval, _, modifier| {
+            let is_enter =
+                keyval == gtk4::gdk::Key::Return || keyval == gtk4::gdk::Key::KP_Enter;
+            if is_enter && !modifier.contains(gtk4::gdk::ModifierType::SHIFT_MASK) {
+                if let Ok(mut st) = s.try_borrow_mut() {
+                    st.on_send_message();
+                }
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        entry_view.add_controller(key);
 
-        // Send button sensitivity follows input text.
+        // Send button sensitivity and placeholder follow the buffer content.
         let s = state.clone();
         let send = s.borrow().send_button.clone();
+        let placeholder = s.borrow().input_placeholder.clone();
         s.borrow()
-            .input_entry
-            .connect_changed(move |entry| send.set_sensitive(!entry.text().is_empty()));
-
-        let s = state.clone();
-        model_search_entry.connect_changed(move |entry| {
-            let text = entry.text().to_string();
-            let query = if text.is_empty() { None } else { Some(text) };
-            s.borrow_mut().filter_models(query.as_deref());
-        });
+            .input_buffer
+            .connect_changed(move |buffer| {
+                let empty = buffer.char_count() == 0;
+                send.set_sensitive(!empty);
+                placeholder.set_visible(empty);
+            });
 
         let s = state.clone();
         let suppress = s.borrow().suppress_model_signal.clone();
@@ -539,6 +546,29 @@ fn message_role(message: &Value) -> Option<&str> {
     message.get("role").and_then(|r| r.as_str())
 }
 
+/// Format a message's epoch-ms `timestamp` field as a local "HH:MM" label.
+fn message_time(message: &Value) -> Option<String> {
+    let millis = message.get("timestamp").and_then(|t| t.as_u64())?;
+    let seconds = (millis / 1000) as i64;
+    let datetime = glib::DateTime::from_unix_local(seconds).ok()?;
+    datetime.format("%H:%M").ok().map(|s| s.to_string())
+}
+
+/// Short one-line summary of tool-call args for a tool card header.
+fn tool_summary(args: Option<&Value>) -> String {
+    let Some(obj) = args.and_then(|a| a.as_object()) else { return String::new() };
+    for key in ["command", "path", "pattern", "file_path", "query", "url", "name"] {
+        if let Some(value) = obj.get(key).and_then(|v| v.as_str()) {
+            return shorten_for_display(value, 60);
+        }
+    }
+    // Fall back to the first string-valued argument.
+    obj.values()
+        .find_map(|v| v.as_str())
+        .map(|v| shorten_for_display(v, 60))
+        .unwrap_or_default()
+}
+
 /// Extract text from a tool result / partial result value
 /// (`{"content":[{"type":"text","text":"..."}], ...}`).
 fn result_text(result: &Value) -> String {
@@ -576,10 +606,10 @@ impl State {
         self.current_session_file = None;
         self.session_named = false;
         self.busy = false;
-        self.title_label.set_label("New chat");
-        self.subtitle_label.set_label("Start a conversation");
+        self.window_title.set_title("New chat");
+        self.window_title.set_subtitle("Start a conversation");
         self.stop_button.set_sensitive(false);
-        self.input_entry.grab_focus();
+        self.input_view.grab_focus();
 
         let receiver = self.rpc.send(PiCommand::NewSession { parent_session: None });
         self.pending = Pending::NewSession(receiver);
@@ -587,18 +617,24 @@ impl State {
         self.show_toast("New chat started");
     }
 
+    fn input_text(&self) -> String {
+        let (start, end) = self.input_buffer.bounds();
+        self.input_buffer.text(&start, &end, false).to_string()
+    }
+
     fn on_send_message(&mut self) {
-        let text = self.input_entry.text().to_string();
+        let text = self.input_text();
         let trimmed = text.trim().to_string();
         if trimmed.is_empty() {
             return;
         }
-        self.input_entry.set_text("");
+        self.input_buffer.set_text("");
 
         self.stack.set_visible_child_name("chat");
 
         // User bubble.
-        self.chat_view.append(&chat::user_message(&trimmed).box_);
+        let time = chat::now_time();
+        self.chat_view.append(&chat::user_message(&trimmed, Some(&time)).box_);
 
         // Name the session after the first user message.
         if !self.session_named {
@@ -607,8 +643,10 @@ impl State {
                 if !name.is_empty() {
                     let _ = self.rpc.send(PiCommand::SetSessionName { name: name.clone() });
                     self.session_list.rename_session(&file, &name);
-                    self.title_label.set_label(&name);
-                    if let Some(entry) = self.sessions.iter_mut().find(|(f, _)| *f == file) {
+                    self.window_title.set_title(&name);
+                    if let Some(entry) =
+                        self.sessions.iter_mut().find(|(f, _, _)| *f == file)
+                    {
                         entry.1 = name;
                     }
                 }
@@ -631,7 +669,7 @@ impl State {
 
             self.busy = true;
             self.stop_button.set_sensitive(true);
-            self.subtitle_label.set_label("Working…");
+            self.window_title.set_subtitle("Working…");
 
             let receiver = self.rpc.send(PiCommand::Prompt { message: trimmed });
             self.pending = Pending::Prompt(receiver);
@@ -648,21 +686,25 @@ impl State {
             self.stack.set_visible_child_name("chat");
             return;
         }
-        let Some(name) = self.sessions.iter().find(|(f, _)| f == id).map(|(_, n)| n.clone())
+        let Some(name) = self
+            .sessions
+            .iter()
+            .find(|(f, _, _)| *f == id)
+            .map(|(_, n, _)| n.clone())
         else {
             return;
         };
 
         self.current_session_file = Some(id.to_string());
         self.session_named = true;
-        self.title_label.set_label(&name);
-        self.subtitle_label.set_label("Resumed chat");
+        self.window_title.set_title(&name);
+        self.window_title.set_subtitle("Resumed chat");
         self.stack.set_visible_child_name("chat");
         self.chat_view.clear();
         self.streaming = None;
         self.tool_blocks.clear();
         self.session_list.set_active(id);
-        self.input_entry.grab_focus();
+        self.input_view.grab_focus();
 
         let receiver = self.rpc.send(PiCommand::SwitchSession { session_path: id.to_string() });
         self.pending = Pending::SwitchSession(receiver);
@@ -734,7 +776,7 @@ impl State {
                         self.show_toast(&format!("Prompt failed: {err}"));
                         self.busy = false;
                         self.stop_button.set_sensitive(false);
-                        self.subtitle_label.set_label("Idle");
+                        self.window_title.set_subtitle("Idle");
                         self.finalize_streaming(None, None);
                     }
                 }
@@ -743,7 +785,7 @@ impl State {
                     self.show_toast("Prompt failed — RPC bridge died");
                     self.busy = false;
                     self.stop_button.set_sensitive(false);
-                    self.subtitle_label.set_label("Idle");
+                    self.window_title.set_subtitle("Idle");
                     self.finalize_streaming(None, None);
                 }
             },
@@ -783,14 +825,20 @@ impl State {
     fn render_messages(&self, messages: &Value) {
         let Some(arr) = messages.as_array() else { return };
         for msg in arr {
-            let text = msg.get("content").map(content_text).unwrap_or_default();
-            if text.is_empty() {
-                continue;
-            }
+            let content = msg.get("content").cloned().unwrap_or_default();
+            let text = content_text(&content);
+            let thinking = content_thinking(&content);
+            let time = message_time(msg);
+            let time = time.as_deref();
             match message_role(msg) {
-                Some("user") => self.chat_view.append(&chat::user_message(&text).box_),
-                Some("assistant") => {
-                    self.chat_view.append(&chat::assistant_message(&text, None).box_)
+                Some("user") if !text.is_empty() => {
+                    self.chat_view.append(&chat::user_message(&text, time).box_)
+                }
+                Some("assistant") if !text.is_empty() || !thinking.is_empty() => {
+                    let thinking = if thinking.is_empty() { None } else { Some(thinking.as_str()) };
+                    self.chat_view.append(
+                        &chat::assistant_message(&text, thinking, time).box_,
+                    )
                 }
                 _ => {}
             }
@@ -821,25 +869,12 @@ impl State {
         }
         models.sort_by(|a, b| a.label.cmp(&b.label));
         self.all_models = models;
-        self.filter_models(None);
-    }
-
-    /// Rebuild the dropdown from `all_models` filtered by `query` (case
-    /// insensitive substring), then re-select the active model.
-    fn filter_models(&mut self, query: Option<&str>) {
-        let query = query.unwrap_or("").to_lowercase();
-        self.filtered_models = self
-            .all_models
-            .iter()
-            .filter(|m| query.is_empty() || m.label.to_lowercase().contains(&query))
-            .cloned()
-            .collect::<Vec<_>>();
+        self.filtered_models = self.all_models.clone();
 
         let string_list = StringList::new(&[]);
         for m in &self.filtered_models {
             string_list.append(&m.label);
         }
-
         self.suppress_model_signal.set(true);
         self.model_dropdown.set_model(Some(&string_list));
         if let Some(label) = self.current_model_label.clone() {
@@ -882,9 +917,6 @@ impl State {
                 self.current_model_label = Some(ModelInfo::new(provider, id).label);
                 self.select_current_model();
             }
-            if let Some(name) = model.get("name").and_then(|n| n.as_str()) {
-                self.subtitle_label.set_label(name);
-            }
         }
 
         // Thinking level.
@@ -903,16 +935,15 @@ impl State {
                     if after_new { "New chat".to_string() } else { "Current session".to_string() }
                 });
             self.current_session_file = Some(file.clone());
-            if !self.sessions.iter().any(|(f, _)| *f == file) {
-                self.sessions.push((file.clone(), name.clone()));
-            } else if let Some(entry) = self.sessions.iter_mut().find(|(f, _)| *f == file) {
+            let time_label = time_label_now();
+            if !self.sessions.iter().any(|(f, _, _)| *f == file) {
+                self.sessions.push((file.clone(), name.clone(), time_label.clone()));
+            } else if let Some(entry) = self.sessions.iter_mut().find(|(f, _, _)| *f == file) {
                 entry.1 = name.clone();
             }
-            self.session_list.add_session(&file, &name, true);
+            self.session_list.add_session(&file, &name, &time_label, true);
             self.session_list.set_active(&file);
-            if self.title_label.text().is_empty() || after_new {
-                self.title_label.set_label(&name);
-            }
+            self.window_title.set_title(&name);
         }
 
         // Auto-compaction.
@@ -974,8 +1005,8 @@ impl State {
     /// Load recent sessions from pi's session store into the sidebar.
     fn load_disk_sessions(&mut self) {
         let sessions = scan_disk_sessions();
-        for (path, name) in &sessions {
-            self.session_list.add_session(path, name, false);
+        for (path, name, time) in &sessions {
+            self.session_list.add_session(path, name, time, false);
         }
         self.sessions = sessions;
     }
@@ -986,12 +1017,12 @@ impl State {
         match event {
             PiEvent::AgentStart => {
                 self.busy = true;
-                self.subtitle_label.set_label("Working…");
+                self.window_title.set_subtitle("Working…");
                 self.stop_button.set_sensitive(true);
             }
             PiEvent::AgentSettled { aborted } => {
                 self.busy = false;
-                self.subtitle_label.set_label("Idle");
+                self.window_title.set_subtitle("Idle");
                 self.stop_button.set_sensitive(false);
                 self.finalize_streaming(None, None);
                 self.chat_view.scroll_to_bottom();
@@ -1004,8 +1035,8 @@ impl State {
                 self.busy = false;
                 self.stop_button.set_sensitive(false);
                 self.send_button.set_sensitive(false);
-                self.input_entry.set_sensitive(false);
-                self.subtitle_label.set_label("pi disconnected — restart the app");
+                self.input_view.set_sensitive(false);
+                self.window_title.set_subtitle("pi disconnected — restart the app");
                 self.show_toast("pi exited — RPC disconnected, please restart pi-gui");
             }
             PiEvent::Response { .. } => {}
@@ -1026,9 +1057,10 @@ impl State {
                     }
                 }
             }
-            PiEvent::ToolExecutionStart { tool_call_id, tool_name } => {
+            PiEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
                 let name = tool_name.clone().unwrap_or_else(|| "tool".into());
-                let block = ToolBlock::new(&name);
+                let summary = tool_summary(args.as_ref());
+                let block = ToolBlock::new(&name, &summary);
                 self.chat_view.append(&block.box_);
                 if let Some(id) = tool_call_id {
                     self.tool_blocks.insert(id.clone(), block);
@@ -1050,7 +1082,7 @@ impl State {
                         if !text.is_empty() {
                             block.set_content(&text);
                         }
-                        block.set_error(*is_error == Some(true));
+                        block.set_finished(*is_error == Some(true));
                     }
                 }
             }
@@ -1077,8 +1109,8 @@ impl State {
             PiEvent::SessionInfoChanged { name } => {
                 if let (Some(name), Some(file)) = (name, self.current_session_file.clone()) {
                     self.session_list.rename_session(&file, name);
-                    self.title_label.set_label(name);
-                    if let Some(entry) = self.sessions.iter_mut().find(|(f, _)| *f == file) {
+                    self.window_title.set_title(name);
+                    if let Some(entry) = self.sessions.iter_mut().find(|(f, _, _)| *f == file) {
                         entry.1 = name.clone();
                     }
                 }
@@ -1158,7 +1190,11 @@ impl State {
             let thinking = thinking.unwrap_or("");
             let has_content = !text.is_empty() || !thinking.is_empty();
             if has_content {
-                let bubble = chat::assistant_message(text, if thinking.is_empty() { None } else { Some(thinking) });
+                let bubble = chat::assistant_message(
+                    text,
+                    if thinking.is_empty() { None } else { Some(thinking) },
+                    None,
+                );
                 // Insert at the streaming bubble's position so tool blocks
                 // that already followed it stay in order.
                 self.chat_view.list.insert_child_after(&bubble.box_, Some(&streaming.container));
@@ -1391,16 +1427,49 @@ impl State {
         if message.is_empty() {
             return;
         }
-        let toast = Toast::builder().title(message).build();
+        // Toast titles are parsed as Pango markup; escape anything the model
+        // or an extension emitted (e.g. "<url>" in a warning message).
+        let title = glib::markup_escape_text(message);
+        let toast = Toast::builder().title(title).build();
         self.chat_view.overlay.add_toast(toast);
     }
 }
 
 // ================= session discovery helpers =================
 
+/// Short human label for a session's age: "Today", "Yesterday", or a
+/// "Mon D" style date.
+fn time_label(mtime: std::time::SystemTime) -> String {
+    let datetime = glib::DateTime::now_local().ok();
+    let file = glib::DateTime::from_unix_local(
+        mtime.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    )
+    .ok();
+    let (Some(now), Some(file)) = (datetime, file) else {
+        return String::new();
+    };
+    match now.difference(&file) {
+        diff if diff.as_days() == 0 && now.day_of_year() == file.day_of_year() => {
+            format!("Today {}", file.format("%H:%M").unwrap_or_default())
+        }
+        diff if diff.as_days() <= 1 => "Yesterday".to_string(),
+        _ => file.format("%b %e").unwrap_or_default().to_string(),
+    }
+}
+
+/// Time label for a session created right now.
+fn time_label_now() -> String {
+    glib::DateTime::now_local()
+        .and_then(|d| d.format("Today %H:%M"))
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
 /// Scan pi's session store (`~/.pi/agent/sessions/`) for recent `.jsonl`
 /// session files, newest first (max 40).
-fn scan_disk_sessions() -> Vec<(String, String)> {
+fn scan_disk_sessions() -> Vec<(String, String, String)> {
     let Some(home) = std::env::var_os("HOME") else { return Vec::new() };
     let root = std::path::Path::new(&home).join(".pi/agent/sessions");
     let mut files: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
@@ -1409,9 +1478,10 @@ fn scan_disk_sessions() -> Vec<(String, String)> {
     files
         .into_iter()
         .take(40)
-        .map(|(path, _)| {
+        .map(|(path, mtime)| {
             let name = session_display_name(&path);
-            (path.to_string_lossy().into_owned(), name)
+            let time = time_label(mtime);
+            (path.to_string_lossy().into_owned(), name, time)
         })
         .collect()
 }
@@ -1510,6 +1580,21 @@ fn models_from_config_file() -> Vec<ModelInfo> {
 
 // ================= welcome page =================
 
+/// Button content with both an icon and a label (GTK4 buttons show only one
+/// of the two when set via the `label`/`icon-name` properties).
+fn icon_label_box(icon_name: &str, text: &str) -> Box {
+    let row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .halign(Align::Center)
+        .build();
+    let icon = Image::builder().icon_name(icon_name).build();
+    let label = Label::builder().label(text).build();
+    row.append(&icon);
+    row.append(&label);
+    row
+}
+
 fn build_welcome_page() -> (Widget, Button) {
     let page = Box::builder()
         .orientation(Orientation::Vertical)
@@ -1517,40 +1602,45 @@ fn build_welcome_page() -> (Widget, Button) {
         .vexpand(true)
         .halign(Align::Center)
         .valign(Align::Center)
-        .spacing(24)
+        .spacing(20)
+        .margin_top(40)
         .build();
 
-    let icon = Image::builder()
-        .icon_name("accessories-text-editor-symbolic")
-        .pixel_size(80)
+    let avatar_circle = Box::builder()
+        .orientation(Orientation::Vertical)
+        .width_request(84)
+        .height_request(84)
+        .css_classes(["welcome-avatar"])
         .build();
-    icon.add_css_class("welcome-icon");
+    let avatar = Label::builder()
+        .label("π")
+        .valign(Align::Center)
+        .hexpand(true)
+        .build();
+    avatar.add_css_class("welcome-avatar-label");
+    avatar_circle.append(&avatar);
 
-    let title = Label::builder()
-        .label("Welcome to pi")
-        .halign(Align::Center)
-        .build();
+    let title = Label::builder().label("pi").halign(Align::Center).build();
     title.add_css_class("welcome-title");
 
     let subtitle = Label::builder()
         .label("Start a new chat to write, explain, or fix code with the pi coding agent.")
         .halign(Align::Center)
         .wrap(true)
-        .max_width_chars(40)
+        .max_width_chars(42)
         .justify(gtk4::Justification::Center)
         .build();
     subtitle.add_css_class("welcome-subtitle");
 
     let new_chat = Button::builder()
-        .label("New chat")
-        .icon_name("document-new-symbolic")
         .css_classes(["suggested-action", "pill"])
         .halign(Align::Center)
         .valign(Align::Center)
         .hexpand(false)
         .build();
+    new_chat.set_child(Some(&icon_label_box("document-new-symbolic", "New chat")));
 
-    page.append(&icon);
+    page.append(&avatar_circle);
     page.append(&title);
     page.append(&subtitle);
     page.append(&new_chat);
