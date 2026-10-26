@@ -101,6 +101,8 @@ struct State {
     suppress_model_signal: Rc<Cell<bool>>,
     suppress_thinking_signal: Rc<Cell<bool>>,
     suppress_autocompact: Rc<Cell<bool>>,
+    /// PI_GUI_OPEN_SESSION auto-open runs once, on the first state load.
+    auto_opened: Cell<bool>,
 
     thinking_levels: Vec<String>,
     current_thinking_level: Option<String>,
@@ -365,6 +367,7 @@ impl PiWindow {
             suppress_model_signal: Rc::new(Cell::new(false)),
             suppress_thinking_signal: Rc::new(Cell::new(false)),
             suppress_autocompact: Rc::new(Cell::new(false)),
+            auto_opened: Cell::new(false),
             thinking_levels: Vec::new(),
             current_thinking_level: None,
             thinking_combo_row,
@@ -955,6 +958,17 @@ impl State {
 
         // Thinking levels for the current model.
         self.pending_levels = Some(self.rpc.send(PiCommand::GetAvailableThinkingLevels));
+
+        // Test/deep-link hook: open a specific session once at startup.
+        if !self.auto_opened.get() {
+            self.auto_opened.set(true);
+            if let Ok(target) = std::env::var("PI_GUI_OPEN_SESSION") {
+                let known = self.sessions.iter().any(|(f, _, _)| *f == target);
+                if known && self.current_session_file.as_deref() != Some(target.as_str()) {
+                    self.on_switch_session(&target);
+                }
+            }
+        }
     }
 
     fn load_levels_done(&mut self, value: &Value) {
@@ -1098,12 +1112,33 @@ impl State {
                     } else {
                         format!("Retrying (attempt {attempt}): {reason}")
                     };
+                    self.ensure_streaming();
+                    if let Some(streaming) = self.streaming.as_ref() {
+                        streaming.show_retry(*attempt, &reason);
+                    }
+                    self.chat_view.scroll_to_bottom();
                     self.show_toast(&msg);
+                }
+            }
+            PiEvent::AutoRetryEnd { success: Some(true), .. } => {
+                if let Some(streaming) = self.streaming.as_ref() {
+                    streaming.retry_done();
                 }
             }
             PiEvent::AutoRetryEnd { success: Some(false), final_error, .. } => {
                 let err = final_error.clone().unwrap_or_default();
-                self.show_toast(&format!("Retry failed: {err}"));
+                // Flush any partial streamed content, then leave a permanent
+                // error row in the transcript (toasts disappear on their own).
+                self.finalize_streaming(None, None);
+                let err = if err.is_empty() {
+                    "The provider failed after repeated retries.".to_string()
+                } else {
+                    format!("Provider error after retries: {}", shorten_for_display(&err, 200))
+                };
+                let bubble = chat::error_message(&err);
+                self.chat_view.append(&bubble.box_);
+                self.chat_view.scroll_to_bottom();
+                self.show_toast("Provider error — see the transcript");
             }
             PiEvent::AutoRetryEnd { .. } => {}
             PiEvent::SessionInfoChanged { name } => {
@@ -1608,14 +1643,15 @@ fn build_welcome_page() -> (Widget, Button) {
 
     let avatar_circle = Box::builder()
         .orientation(Orientation::Vertical)
+        .halign(Align::Center)
         .width_request(84)
         .height_request(84)
         .css_classes(["welcome-avatar"])
         .build();
     let avatar = Label::builder()
         .label("π")
+        .halign(Align::Center)
         .valign(Align::Center)
-        .hexpand(true)
         .build();
     avatar.add_css_class("welcome-avatar-label");
     avatar_circle.append(&avatar);

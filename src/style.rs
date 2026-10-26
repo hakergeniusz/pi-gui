@@ -119,6 +119,24 @@ window {
     font-size: 0.9em;
 }
 
+/* --- persistent provider error row --- */
+.error-row {
+    background-color: alpha(@error_color, 0.09);
+    border: 1px solid alpha(@error_color, 0.4);
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-top: 12px;
+}
+
+.error-icon {
+    color: @error_color;
+}
+
+.error-text {
+    color: @error_color;
+    font-size: 0.92em;
+}
+
 /* --- collapsible reasoning --- */
 .reasoning-toggle {
     border-radius: 8px;

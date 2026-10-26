@@ -34,11 +34,13 @@ fn avatar(size: i32) -> Box {
         .height_request(size)
         .css_classes(["avatar"])
         .build();
+    // No hexpand here: a child's expand flag leaks through the circle via
+    // GTK's compute_expand, which would make the whole avatar an expanding
+    // child of the header row (it then swallows half the row's spare width).
     let label = Label::builder()
         .label("π")
-        .justify(gtk4::Justification::Center)
+        .halign(Align::Center)
         .valign(Align::Center)
-        .hexpand(true)
         .build();
     label.add_css_class("avatar-label");
     circle.append(&label);
@@ -46,6 +48,8 @@ fn avatar(size: i32) -> Box {
 }
 
 /// Header row shown above assistant content: avatar, "pi", optional time.
+/// A trailing spacer consumes all extra space so the group always sits at the
+/// left edge regardless of how the parent distributes spare width.
 fn assistant_header(time: Option<&str>) -> Box {
     let row = Box::builder()
         .orientation(Orientation::Horizontal)
@@ -55,7 +59,11 @@ fn assistant_header(time: Option<&str>) -> Box {
 
     row.append(&avatar(28));
 
-    let name = Label::builder().label("pi").valign(Align::Center).build();
+    let name = Label::builder()
+        .label("pi")
+        .valign(Align::Center)
+        .halign(Align::Start)
+        .build();
     name.add_css_class("assistant-name");
     row.append(&name);
 
@@ -63,12 +71,19 @@ fn assistant_header(time: Option<&str>) -> Box {
         let time = Label::builder()
             .label(format!("· {time}"))
             .valign(Align::Center)
+            .halign(Align::Start)
             .build();
         time.add_css_class("msg-time");
         row.append(&time);
     }
 
+    row.append(&spacer());
     row
+}
+
+/// An invisible box that absorbs all spare horizontal space.
+fn spacer() -> Box {
+    Box::builder().hexpand(true).halign(Align::Fill).build()
 }
 
 /// Collapsible reasoning ("thinking") block: a toggle row labeled "Reasoning"
@@ -188,9 +203,12 @@ pub fn user_message(text: &str, time: Option<&str>) -> MessageBubble {
         .hexpand(true)
         .build();
 
+    // Leading spacer pushes the bubble to the right edge no matter how the
+    // parent Box distributes spare width.
+    bubble_row.append(&spacer());
+
     let bubble = Box::builder()
         .orientation(Orientation::Vertical)
-        .halign(Align::End)
         .valign(Align::Start)
         .css_classes(["bubble-user"])
         .build();
@@ -259,6 +277,38 @@ pub fn assistant_message(text: &str, thinking: Option<&str>, time: Option<&str>)
     MessageBubble { box_: container }
 }
 
+/// Build a persistent error row shown when the provider gives up (all retries
+/// exhausted) — plain toasts vanish, this stays in the transcript.
+pub fn error_message(text: &str) -> MessageBubble {
+    let container = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .hexpand(true)
+        .valign(Align::Start)
+        .spacing(8)
+        .margin_top(4)
+        .margin_bottom(4)
+        .css_classes(["error-row"])
+        .build();
+
+    let icon = Image::builder().icon_name("dialog-warning-symbolic").build();
+    icon.add_css_class("error-icon");
+    container.append(&icon);
+
+    let label = Label::builder()
+        .label(text)
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(pango::WrapMode::WordChar)
+        .max_width_chars(78)
+        .hexpand(true)
+        .selectable(true)
+        .build();
+    label.add_css_class("error-text");
+    container.append(&label);
+
+    MessageBubble { box_: container }
+}
+
 /// A streaming assistant row: header, animated status line, live reasoning
 /// block, and the accumulating answer text. The status line disappears once
 /// answer text starts arriving, and the reasoning block collapses then too.
@@ -267,6 +317,7 @@ pub struct StreamingBubble {
     pub label: Label,
     pub reasoning: ReasoningBox,
     status_row: Box,
+    status_label: Label,
     saw_text: std::cell::Cell<bool>,
 }
 
@@ -291,10 +342,10 @@ impl StreamingBubble {
         let spinner = Spinner::new();
         spinner.start();
         spinner.set_size_request(14, 14);
-        let status = Label::builder().label("Thinking…").xalign(0.0).build();
-        status.add_css_class("stream-status");
+        let status_label = Label::builder().label("Thinking…").xalign(0.0).build();
+        status_label.add_css_class("stream-status");
         status_row.append(&spinner);
-        status_row.append(&status);
+        status_row.append(&status_label);
 
         let reasoning = ReasoningBox::new();
         reasoning.container.set_visible(false);
@@ -320,6 +371,7 @@ impl StreamingBubble {
             label,
             reasoning,
             status_row,
+            status_label,
             saw_text: std::cell::Cell::new(false),
         }
     }
@@ -329,6 +381,30 @@ impl StreamingBubble {
             self.saw_text.set(true);
             self.status_row.set_visible(false);
             self.reasoning.collapse();
+        }
+    }
+
+    /// Show a persistent retry notice in the status line (the provider failed
+    /// and pi is retrying — otherwise the UI would sit silently on
+    /// "Thinking…").
+    pub fn show_retry(&self, attempt: u32, reason: &str) {
+        let text = if reason.is_empty() {
+            format!("Retrying (attempt {attempt})…")
+        } else {
+            format!("Retrying (attempt {attempt}) — {reason}")
+        };
+        self.status_label.set_text(&text);
+        self.status_row.set_visible(true);
+    }
+
+    /// The retry succeeded: back to the plain thinking indicator (or nothing
+    /// if answer text already arrived).
+    pub fn retry_done(&self) {
+        if self.saw_text.get() {
+            self.status_row.set_visible(false);
+        } else {
+            self.status_label.set_text("Thinking…".to_string().as_str());
+            self.status_row.set_visible(true);
         }
     }
 
