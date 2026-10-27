@@ -137,6 +137,17 @@ window {
     font-size: 0.92em;
 }
 
+/* --- session loading placeholder --- */
+.loading-label {
+    color: alpha(@view_fg_color, 0.55);
+    font-size: 0.95em;
+}
+
+/* --- hover edit button on user messages --- */
+.msg-edit-btn {
+    opacity: 0.75;
+}
+
 /* --- collapsible reasoning --- */
 .reasoning-toggle {
     border-radius: 8px;

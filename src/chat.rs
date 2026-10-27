@@ -8,7 +8,7 @@
 
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box, Image, Label, Orientation, Revealer, ScrolledWindow, Spinner, ToggleButton,
+    Align, Box, Button, Image, Label, Orientation, Revealer, ScrolledWindow, Spinner, ToggleButton,
 };
 use libadwaita::ToastOverlay;
 
@@ -189,8 +189,14 @@ impl ReasoningBox {
     }
 }
 
-/// Build a user message row: right-aligned tinted bubble with the time.
-pub fn user_message(text: &str, time: Option<&str>) -> MessageBubble {
+/// Build a user message row: right-aligned tinted bubble with the time, and
+/// (when `on_edit` is given) a pencil button revealed on hover that lets the
+/// message text be re-sent.
+pub fn user_message(
+    text: &str,
+    time: Option<&str>,
+    on_edit: Option<std::rc::Rc<dyn Fn()>>,
+) -> MessageBubble {
     let container = Box::builder()
         .orientation(Orientation::Vertical)
         .hexpand(true)
@@ -225,6 +231,27 @@ pub fn user_message(text: &str, time: Option<&str>) -> MessageBubble {
     bubble.append(&label);
     bubble_row.append(&bubble);
     container.append(&bubble_row);
+
+    if let Some(on_edit) = on_edit {
+        // Pencil button left of the bubble; visible only while hovering.
+        let edit_btn = Button::builder()
+            .icon_name("document-edit-symbolic")
+            .css_classes(["flat", "msg-edit-btn"])
+            .valign(Align::Center)
+            .margin_end(6)
+            .tooltip_text("Edit message")
+            .build();
+        edit_btn.set_visible(false);
+        edit_btn.connect_clicked(move |_| on_edit());
+        bubble_row.append(&edit_btn);
+
+        let hover_btn = edit_btn.clone();
+        let controller = gtk4::EventControllerMotion::new();
+        controller.connect_enter(move |_, _, _| hover_btn.set_visible(true));
+        let leave_btn = edit_btn.clone();
+        controller.connect_leave(move |_| leave_btn.set_visible(false));
+        bubble_row.add_controller(controller);
+    }
 
     if let Some(time) = time.filter(|t| !t.is_empty()) {
         let time = Label::builder()

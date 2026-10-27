@@ -2,7 +2,7 @@
 //! selection pills, icon + title + dim date subtitle per row.
 
 use gtk4::prelude::*;
-use gtk4::{Align, Box, Button, Image, Label, Orientation, ScrolledWindow};
+use gtk4::{Align, Box, Button, Image, Label, Orientation, ScrolledWindow, Spinner};
 use pango::EllipsizeMode;
 
 use std::cell::RefCell;
@@ -15,6 +15,8 @@ pub struct SessionRow {
     title: Label,
     #[allow(dead_code)] // kept so the row can update its date label later
     subtitle: Label,
+    icon: Image,
+    spinner: Spinner,
     id: String,
 }
 
@@ -40,6 +42,14 @@ impl SessionRow {
             .margin_top(2)
             .build();
         icon.add_css_class("session-icon");
+
+        // Swapped in for the icon while this session's agent is running.
+        let spinner = Spinner::new();
+        spinner.set_size_request(16, 16);
+        spinner.set_valign(Align::Start);
+        spinner.set_margin_top(2);
+        spinner.set_visible(false);
+        spinner.start();
 
         let texts = Box::builder()
             .orientation(Orientation::Vertical)
@@ -67,6 +77,7 @@ impl SessionRow {
         texts.append(&subtitle);
 
         row.append(&icon);
+        row.append(&spinner);
         row.append(&texts);
         button.set_child(Some(&row));
 
@@ -74,6 +85,8 @@ impl SessionRow {
             button,
             title,
             subtitle,
+            icon,
+            spinner,
             id: id.to_string(),
         }
     }
@@ -84,6 +97,12 @@ impl SessionRow {
         } else {
             self.button.remove_css_class("active");
         }
+    }
+
+    /// Show a spinner instead of the file icon while the agent works.
+    pub fn set_busy(&self, busy: bool) {
+        self.icon.set_visible(!busy);
+        self.spinner.set_visible(busy);
     }
 }
 
@@ -160,6 +179,15 @@ impl SessionList {
     pub fn set_active(&self, id: &str) {
         for row in self.rows.borrow().iter() {
             row.set_active(row.id == id);
+        }
+    }
+
+    /// Mark the session currently running the agent with a spinner.
+    pub fn set_busy(&self, id: &str, busy: bool) {
+        for row in self.rows.borrow().iter() {
+            if row.id == id {
+                row.set_busy(busy);
+            }
         }
     }
 }

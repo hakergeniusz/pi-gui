@@ -11,7 +11,7 @@ use crate::session_list::SessionList;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box, Button, DropDown, Entry, EventControllerKey, Image, Label, ListBox, ListBoxRow,
-    Orientation, Overlay, PropertyExpression, ScrolledWindow, Separator, StringList, Stack,
+    Orientation, Overlay, PropertyExpression, ScrolledWindow, Separator, Spinner, StringList, Stack,
     TextView, Widget,
 };
 use libadwaita::prelude::*;
@@ -70,6 +70,7 @@ struct State {
     session_list: SessionList,
 
     window_title: WindowTitle,
+    busy_spinner: Spinner,
     model_dropdown: DropDown,
 
     all_models: Vec<ModelInfo>,
@@ -103,6 +104,11 @@ struct State {
     suppress_autocompact: Rc<Cell<bool>>,
     /// PI_GUI_OPEN_SESSION auto-open runs once, on the first state load.
     auto_opened: Cell<bool>,
+
+    /// Placeholder shown in the transcript while a resumed session loads.
+    loading_row: gtk4::Box,
+    /// When the current session switch started (for stderr timing logs).
+    switch_started: Option<std::time::Instant>,
 
     thinking_levels: Vec<String>,
     current_thinking_level: Option<String>,
@@ -139,8 +145,37 @@ impl PiWindow {
         new_chat_btn.set_tooltip_text(Some("New chat"));
         header.pack_start(&new_chat_btn);
 
-        window_title.set_subtitle("GNOME AI coding assistant");
-        header.set_title_widget(Some(&window_title));
+        // Additional windows each carry their own independent session.
+        let new_window_btn = Button::builder()
+            .icon_name("window-new-symbolic")
+            .css_classes(["flat"])
+            .valign(Align::Center)
+            .build();
+        new_window_btn.set_tooltip_text(Some("New window — run another session alongside"));
+        {
+            let app_for_window = app.clone();
+            new_window_btn.connect_clicked(move |_| {
+                app_for_window.activate();
+            });
+        }
+        header.pack_start(&new_window_btn);
+
+        // Title with a working indicator spinner that appears while the
+        // agent runs.
+        let busy_spinner = Spinner::new();
+        busy_spinner.set_size_request(16, 16);
+        busy_spinner.set_visible(false);
+        let title_box = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(8)
+            .valign(Align::Center)
+            .build();
+        title_box.append(&busy_spinner);
+        title_box.append(&window_title);
+
+        // pi's first RPC takes seconds (provider + extension discovery); say so.
+        window_title.set_subtitle("Starting pi…");
+        header.set_title_widget(Some(&title_box));
 
         // Model dropdown (end): searchable in-place over all providers.
         let model_list = StringList::new(&["Loading models…"]);
@@ -161,7 +196,7 @@ impl PiWindow {
 
         // Settings button (end)
         let settings_button = Button::builder()
-            .icon_name("preferences-system-symbolic")
+            .icon_name("emblem-system-symbolic")
             .css_classes(["flat"])
             .valign(Align::Center)
             .build();
@@ -258,6 +293,29 @@ impl PiWindow {
         let chat_view = ChatView::new();
         chat_page.append(&chat_view.scrolled);
 
+        // "Loading" placeholder shown while a resumed session's messages are
+        // fetched and rendered (big sessions can take a moment).
+        let loading_spinner = Spinner::new();
+        loading_spinner.start();
+        let loading_label = Label::new(Some("Loading messages…"));
+        loading_label.add_css_class("loading-label");
+        let loading_inner = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(10)
+            .halign(Align::Center)
+            .valign(Align::Start)
+            .margin_top(24)
+            .build();
+        loading_inner.append(&loading_spinner);
+        loading_inner.append(&loading_label);
+        let loading_row = Box::builder()
+            .orientation(Orientation::Vertical)
+            .hexpand(true)
+            .valign(Align::Start)
+            .build();
+        loading_row.append(&loading_inner);
+        loading_row.set_visible(false);
+
         // Input area: rounded card with a multiline entry, circular send and
         // stop buttons. Enter sends, Shift+Enter inserts a newline.
         let input_card = Box::builder()
@@ -345,6 +403,7 @@ impl PiWindow {
             chat_view,
             session_list,
             window_title,
+            busy_spinner,
             model_dropdown,
             all_models: Vec::new(),
             filtered_models: Vec::new(),
@@ -368,6 +427,8 @@ impl PiWindow {
             suppress_thinking_signal: Rc::new(Cell::new(false)),
             suppress_autocompact: Rc::new(Cell::new(false)),
             auto_opened: Cell::new(false),
+            loading_row,
+            switch_started: None,
             thinking_levels: Vec::new(),
             current_thinking_level: None,
             thinking_combo_row,
@@ -616,8 +677,6 @@ impl State {
 
         let receiver = self.rpc.send(PiCommand::NewSession { parent_session: None });
         self.pending = Pending::NewSession(receiver);
-
-        self.show_toast("New chat started");
     }
 
     fn input_text(&self) -> String {
@@ -637,7 +696,15 @@ impl State {
 
         // User bubble.
         let time = chat::now_time();
-        self.chat_view.append(&chat::user_message(&trimmed, Some(&time)).box_);
+        let buffer = self.input_buffer.clone();
+        let view = self.input_view.clone();
+        let sent = trimmed.clone();
+        let on_edit: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+            buffer.set_text(&sent);
+            view.grab_focus();
+        });
+        self.chat_view
+            .append(&chat::user_message(&trimmed, Some(&time), Some(on_edit)).box_);
 
         // Name the session after the first user message.
         if !self.session_named {
@@ -701,9 +768,12 @@ impl State {
         self.current_session_file = Some(id.to_string());
         self.session_named = true;
         self.window_title.set_title(&name);
-        self.window_title.set_subtitle("Resumed chat");
+        self.window_title.set_subtitle("Loading…");
         self.stack.set_visible_child_name("chat");
         self.chat_view.clear();
+        self.chat_view.append(&self.loading_row);
+        self.loading_row.set_visible(true);
+        self.switch_started = Some(std::time::Instant::now());
         self.streaming = None;
         self.tool_blocks.clear();
         self.session_list.set_active(id);
@@ -802,11 +872,16 @@ impl State {
                     if ok && !cancelled {
                         self.pending = Pending::GetMessages(self.rpc.send(PiCommand::GetMessages));
                     } else {
+                        self.loading_row.set_visible(false);
+                        self.chat_view.list.remove(&self.loading_row);
+                        self.window_title.set_subtitle("Idle");
                         self.show_toast("Session switch cancelled");
                     }
                 }
                 Err(TryRecvError::Empty) => self.pending = Pending::SwitchSession(recv),
                 Err(TryRecvError::Disconnected) => {
+                    self.loading_row.set_visible(false);
+                    self.chat_view.list.remove(&self.loading_row);
                     self.show_toast("Session switch failed — RPC bridge died")
                 }
             },
@@ -819,10 +894,27 @@ impl State {
     }
 
     fn load_history_done(&mut self, value: &Value) {
-        if let Some(messages) = value.pointer("/data/messages") {
-            self.render_messages(messages);
+        self.loading_row.set_visible(false);
+        self.chat_view.list.remove(&self.loading_row);
+        self.window_title.set_subtitle("Resumed chat");
+        if let Some(started) = self.switch_started.take() {
+            let render_start = std::time::Instant::now();
+            let count = value
+                .pointer("/data/messages")
+                .and_then(|m| m.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if let Some(messages) = value.pointer("/data/messages") {
+                self.render_messages(messages);
+            }
+            self.chat_view.scroll_to_bottom();
+            eprintln!(
+                "[timing] session load: {} ms to messages ({}), {} ms to render",
+                started.elapsed().as_millis(),
+                count,
+                render_start.elapsed().as_millis()
+            );
         }
-        self.chat_view.scroll_to_bottom();
     }
 
     fn render_messages(&self, messages: &Value) {
@@ -835,7 +927,15 @@ impl State {
             let time = time.as_deref();
             match message_role(msg) {
                 Some("user") if !text.is_empty() => {
-                    self.chat_view.append(&chat::user_message(&text, time).box_)
+                    let buffer = self.input_buffer.clone();
+                    let view = self.input_view.clone();
+                    let owned = text.clone();
+                    let on_edit: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+                        buffer.set_text(&owned);
+                        view.grab_focus();
+                    });
+                    self.chat_view
+                        .append(&chat::user_message(&text, time, Some(on_edit)).box_)
                 }
                 Some("assistant") if !text.is_empty() || !thinking.is_empty() => {
                     let thinking = if thinking.is_empty() { None } else { Some(thinking.as_str()) };
@@ -902,7 +1002,6 @@ impl State {
             .rpc
             .send(PiCommand::SetModel { provider: info.provider, model_id: info.id });
         self.current_model_label = Some(info.label.clone());
-        self.show_toast(&format!("Model: {}", info.label));
     }
 
     // ================= state sync =================
@@ -947,6 +1046,7 @@ impl State {
             self.session_list.add_session(&file, &name, &time_label, true);
             self.session_list.set_active(&file);
             self.window_title.set_title(&name);
+            self.window_title.set_subtitle("GNOME AI coding assistant");
         }
 
         // Auto-compaction.
@@ -1032,21 +1132,33 @@ impl State {
             PiEvent::AgentStart => {
                 self.busy = true;
                 self.window_title.set_subtitle("Working…");
+                self.busy_spinner.start();
+                self.busy_spinner.set_visible(true);
+                if let Some(file) = self.current_session_file.clone() {
+                    self.session_list.set_busy(&file, true);
+                }
                 self.stop_button.set_sensitive(true);
             }
-            PiEvent::AgentSettled { aborted } => {
+            PiEvent::AgentSettled { aborted: _ } => {
                 self.busy = false;
                 self.window_title.set_subtitle("Idle");
+                self.busy_spinner.stop();
+                self.busy_spinner.set_visible(false);
+                if let Some(file) = self.current_session_file.clone() {
+                    self.session_list.set_busy(&file, false);
+                }
                 self.stop_button.set_sensitive(false);
                 self.finalize_streaming(None, None);
                 self.chat_view.scroll_to_bottom();
-                if *aborted == Some(true) {
-                    self.show_toast("Stopped");
-                }
             }
             PiEvent::AgentEnd | PiEvent::TurnStart | PiEvent::TurnEnd | PiEvent::Other => {}
             PiEvent::Disconnected => {
                 self.busy = false;
+                self.busy_spinner.stop();
+                self.busy_spinner.set_visible(false);
+                if let Some(file) = self.current_session_file.clone() {
+                    self.session_list.set_busy(&file, false);
+                }
                 self.stop_button.set_sensitive(false);
                 self.send_button.set_sensitive(false);
                 self.input_view.set_sensitive(false);
@@ -1103,21 +1215,17 @@ impl State {
             PiEvent::EntryAppended { .. } => {}
             PiEvent::AutoRetryStart { attempt, error_message } => {
                 if let Some(attempt) = attempt {
+                    // The streaming bubble carries a persistent status line;
+                    // a toast here would just add noise on every attempt.
                     let reason = error_message
                         .as_deref()
                         .map(|s| shorten_for_display(s, 80))
                         .unwrap_or_default();
-                    let msg = if reason.is_empty() {
-                        format!("Retrying (attempt {attempt})…")
-                    } else {
-                        format!("Retrying (attempt {attempt}): {reason}")
-                    };
                     self.ensure_streaming();
                     if let Some(streaming) = self.streaming.as_ref() {
                         streaming.show_retry(*attempt, &reason);
                     }
                     self.chat_view.scroll_to_bottom();
-                    self.show_toast(&msg);
                 }
             }
             PiEvent::AutoRetryEnd { success: Some(true), .. } => {
@@ -1138,7 +1246,6 @@ impl State {
                 let bubble = chat::error_message(&err);
                 self.chat_view.append(&bubble.box_);
                 self.chat_view.scroll_to_bottom();
-                self.show_toast("Provider error — see the transcript");
             }
             PiEvent::AutoRetryEnd { .. } => {}
             PiEvent::SessionInfoChanged { name } => {
