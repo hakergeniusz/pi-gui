@@ -60,7 +60,7 @@ fn assistant_header(time: Option<&str>) -> Box {
     row.append(&avatar(28));
 
     let name = Label::builder()
-        .label("pi")
+        .label("Agent")
         .valign(Align::Center)
         .halign(Align::Start)
         .build();
@@ -154,6 +154,27 @@ impl ReasoningBox {
     pub fn set_text(&self, text: &str) {
         self.body.set_text(text);
         self.container.set_visible(!text.is_empty());
+    }
+
+    /// Replace the toggle label with how long the agent thought, once the
+    /// thinking part of the message finished.
+    pub fn set_duration(&self, secs: u64) {
+        let label = if secs == 1 { "Thought for 1s".to_string() } else { format!("Thought for {secs}s") };
+        self.set_toggle_label(&label);
+    }
+
+    fn set_toggle_label(&self, label: &str) {
+        if let Some(box_) = self
+            .container
+            .first_child()
+            .and_then(|c| c.downcast::<ToggleButton>().ok())
+            .and_then(|t| t.child())
+            .and_then(|c| c.downcast::<Box>().ok())
+        {
+            if let Some(child) = box_.last_child().and_then(|c| c.downcast::<Label>().ok()) {
+                child.set_label(label);
+            }
+        }
     }
 
     /// Append streaming reasoning text; keeps the block expanded while it
@@ -266,9 +287,18 @@ pub fn user_message(
     MessageBubble { box_: container }
 }
 
-/// Build an assistant message row: avatar + "pi" + time header, optional
-/// collapsed reasoning block, and selectable answer text.
-pub fn assistant_message(text: &str, thinking: Option<&str>, time: Option<&str>) -> MessageBubble {
+/// Build an assistant message row: optional "Agent" + time header, collapsed
+/// reasoning block, and selectable answer text. `with_header` is false for
+/// follow-up assistant rows inside the same turn so the header appears only
+/// once under the user's message. `thought_secs` labels the reasoning toggle
+/// when the thinking duration is known (live runs).
+pub fn assistant_message(
+    text: &str,
+    thinking: Option<&str>,
+    time: Option<&str>,
+    with_header: bool,
+    thought_secs: Option<u64>,
+) -> MessageBubble {
     let container = Box::builder()
         .orientation(Orientation::Vertical)
         .hexpand(true)
@@ -278,11 +308,18 @@ pub fn assistant_message(text: &str, thinking: Option<&str>, time: Option<&str>)
         .css_classes(["assistant-row"])
         .build();
 
-    container.append(&assistant_header(time));
+    if with_header {
+        container.append(&assistant_header(time));
+    } else {
+        container.set_margin_top(0);
+    }
 
     if let Some(thinking) = thinking.filter(|t| !t.is_empty()) {
         let reasoning = ReasoningBox::new();
         reasoning.set_text(thinking);
+        if let Some(secs) = thought_secs {
+            reasoning.set_duration(secs);
+        }
         container.append(&reasoning.container);
     }
 
@@ -336,9 +373,10 @@ pub fn error_message(text: &str) -> MessageBubble {
     MessageBubble { box_: container }
 }
 
-/// A streaming assistant row: header, animated status line, live reasoning
-/// block, and the accumulating answer text. The status line disappears once
-/// answer text starts arriving, and the reasoning block collapses then too.
+/// A streaming assistant row: optional header, animated status line, live
+/// reasoning block, and the accumulating answer text. The status line
+/// disappears once answer text starts arriving, and the reasoning block
+/// collapses then too (its toggle label becomes "Thought for Ns").
 pub struct StreamingBubble {
     pub container: Box,
     pub label: Label,
@@ -346,10 +384,15 @@ pub struct StreamingBubble {
     status_row: Box,
     status_label: Label,
     saw_text: std::cell::Cell<bool>,
+    /// Whether this row drew the "Agent" header (first row of the turn).
+    pub has_header: bool,
+    thinking_started: std::cell::Cell<Option<std::time::Instant>>,
+    /// How long the thinking phase took, once it finished.
+    thought_secs: std::cell::Cell<Option<u64>>,
 }
 
 impl StreamingBubble {
-    pub fn new() -> Self {
+    pub fn new(with_header: bool) -> Self {
         let container = Box::builder()
             .orientation(Orientation::Vertical)
             .hexpand(true)
@@ -359,7 +402,11 @@ impl StreamingBubble {
             .css_classes(["assistant-row"])
             .build();
 
-        container.append(&assistant_header(Some(&now_time())));
+        if with_header {
+            container.append(&assistant_header(Some(&now_time())));
+        } else {
+            container.set_margin_top(0);
+        }
 
         let status_row = Box::builder()
             .orientation(Orientation::Horizontal)
@@ -400,7 +447,25 @@ impl StreamingBubble {
             status_row,
             status_label,
             saw_text: std::cell::Cell::new(false),
+            has_header: with_header,
+            thinking_started: std::cell::Cell::new(None),
+            thought_secs: std::cell::Cell::new(None),
         }
+    }
+
+    /// The thinking part of this message finished: label the reasoning toggle
+    /// with how long it took, and remember it for the finalized bubble.
+    pub fn finish_thinking(&self) {
+        if let Some(started) = self.thinking_started.get() {
+            let secs = started.elapsed().as_secs();
+            self.thought_secs.set(Some(secs));
+            self.reasoning.set_duration(secs);
+        }
+    }
+
+    /// Measured thinking duration of this message, if it already finished.
+    pub fn thought_secs(&self) -> Option<u64> {
+        self.thought_secs.get()
     }
 
     fn text_started(&self) {
@@ -408,6 +473,7 @@ impl StreamingBubble {
             self.saw_text.set(true);
             self.status_row.set_visible(false);
             self.reasoning.collapse();
+            self.finish_thinking();
         }
     }
 
@@ -449,6 +515,9 @@ impl StreamingBubble {
     }
 
     pub fn append_thinking(&self, text: &str) {
+        if self.thinking_started.get().is_none() {
+            self.thinking_started.set(Some(std::time::Instant::now()));
+        }
         self.reasoning.append(text);
     }
 
@@ -476,7 +545,8 @@ fn tool_icon(tool_name: &str) -> &'static str {
 
 /// A tool-run card: clickable header (chevron, tool icon, name, arg summary,
 /// running spinner / done marker) over a collapsible monospace result body.
-/// Expanded while the tool runs; collapses when it finishes.
+/// Expanded while the tool runs; collapses when it finishes. Write/edit runs
+/// embed the file content / diff in the body instead of just the result line.
 pub struct ToolBlock {
     pub box_: Box,
     content: Box,
@@ -485,6 +555,24 @@ pub struct ToolBlock {
     revealer: Revealer,
     spinner: Spinner,
     status_icon: Image,
+    /// Body carries file content / diff; later results get appended, not
+    /// replacing it.
+    embedded: std::cell::Cell<bool>,
+}
+
+/// Cap for embedded file contents so a huge write doesn't stall the UI.
+const MAX_EMBED_LINES: usize = 200;
+/// Cap per side of a rendered edit diff.
+const MAX_DIFF_LINES: usize = 40;
+
+fn cap_lines(text: &str, max: usize) -> String {
+    let count = text.lines().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.lines().take(max).collect::<Vec<_>>().join("\n");
+    out.push_str(&format!("\n… (+{} more lines)", count - max));
+    out
 }
 
 impl ToolBlock {
@@ -576,7 +664,91 @@ impl ToolBlock {
         container.append(&header);
         container.append(&revealer);
 
-        Self { box_: container, content, title, chevron, revealer, spinner, status_icon }
+        Self {
+            box_: container,
+            content,
+            title,
+            chevron,
+            revealer,
+            spinner,
+            status_icon,
+            embedded: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Show the full content written by a write tool in the body; the final
+    /// result line is appended below it instead of replacing it.
+    pub fn set_embedded_text(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let body = format!("{}\n\n{}", cap_lines(text, MAX_EMBED_LINES), "— wrote this file —");
+        self.set_content(&body);
+        self.embedded.set(true);
+    }
+
+    /// Show old→new blocks for an edit tool run.
+    pub fn set_embedded_diff(&self, edits: &[(String, String)]) {
+        if edits.is_empty() {
+            return;
+        }
+        while let Some(child) = self.content.first_child() {
+            self.content.remove(&child);
+        }
+        for (old, new) in edits {
+            let removed = Label::builder()
+                .label(cap_lines(old, MAX_DIFF_LINES))
+                .xalign(0.0)
+                .yalign(0.0)
+                .wrap(true)
+                .wrap_mode(pango::WrapMode::WordChar)
+                .max_width_chars(88)
+                .hexpand(true)
+                .build();
+            removed.add_css_class("tool-text");
+            removed.add_css_class("monospace");
+            removed.add_css_class("diff-old");
+            self.content.append(&removed);
+
+            let added = Label::builder()
+                .label(cap_lines(new, MAX_DIFF_LINES))
+                .xalign(0.0)
+                .yalign(0.0)
+                .wrap(true)
+                .wrap_mode(pango::WrapMode::WordChar)
+                .max_width_chars(88)
+                .hexpand(true)
+                .build();
+            added.add_css_class("tool-text");
+            added.add_css_class("monospace");
+            added.add_css_class("diff-new");
+            self.content.append(&added);
+        }
+        self.embedded.set(true);
+    }
+
+    /// Whether the body already carries embedded content (append results).
+    pub fn is_embedded(&self) -> bool {
+        self.embedded.get()
+    }
+
+    /// Append a result line below embedded content without replacing it.
+    pub fn append_result(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let label = Label::builder()
+            .label(text)
+            .xalign(0.0)
+            .yalign(0.0)
+            .wrap(true)
+            .wrap_mode(pango::WrapMode::WordChar)
+            .max_width_chars(88)
+            .hexpand(true)
+            .build();
+        label.add_css_class("tool-text");
+        label.add_css_class("monospace");
+        self.content.append(&label);
     }
 
     /// Replace the body with `text` (latest partial or final tool result).

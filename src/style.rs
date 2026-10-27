@@ -217,6 +217,21 @@ window {
     color: alpha(@view_fg_color, 0.8);
 }
 
+/* --- embedded write content / edit diffs --- */
+.diff-old {
+    color: alpha(@error_color, 0.85);
+    background-color: alpha(@error_color, 0.08);
+    border-radius: 4px;
+    padding: 2px 6px;
+}
+
+.diff-new {
+    color: alpha(@success_color, 0.9);
+    background-color: alpha(@success_color, 0.08);
+    border-radius: 4px;
+    padding: 2px 6px;
+}
+
 /* ================= Input bar ================= */
 .input-card {
     background-color: @card_bg_color;

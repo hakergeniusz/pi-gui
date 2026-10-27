@@ -85,6 +85,8 @@ struct State {
 
     streaming: Option<StreamingBubble>,
     tool_blocks: HashMap<String, ToolBlock>,
+    /// The current assistant turn already drew its "Agent" header.
+    turn_header_shown: bool,
 
     pending: Pending,
     pending_models: Option<Receiver<Value>>,
@@ -110,6 +112,12 @@ struct State {
     /// When the current session switch started (for stderr timing logs).
     switch_started: Option<std::time::Instant>,
 
+    /// Session to open automatically on the first state load (new windows).
+    forced_open: Option<String>,
+
+    /// Application handle, for spawning additional windows.
+    app: libadwaita::Application,
+
     thinking_levels: Vec<String>,
     current_thinking_level: Option<String>,
 
@@ -124,7 +132,6 @@ pub struct PiWindow {
 impl PiWindow {
     pub fn new(app: &libadwaita::Application) -> Self {
         let (rpc, events) = crate::rpc::spawn().expect("failed to start pi RPC");
-
         let window = gtk4::ApplicationWindow::builder()
             .application(app)
             .default_width(1100)
@@ -415,6 +422,7 @@ impl PiWindow {
             stop_button,
             streaming: None,
             tool_blocks: HashMap::new(),
+            turn_header_shown: false,
             pending: Pending::None,
             pending_models: None,
             pending_state: None,
@@ -429,6 +437,8 @@ impl PiWindow {
             auto_opened: Cell::new(false),
             loading_row,
             switch_started: None,
+            forced_open: None,
+            app: app.clone(),
             thinking_levels: Vec::new(),
             current_thinking_level: None,
             thinking_combo_row,
@@ -560,6 +570,15 @@ impl PiWindow {
         Self { inner: state }
     }
 
+    /// A window that auto-opens `session_path` once its state loads — used
+    /// when the user clicks a session while another agent is still running,
+    /// so both chats run concurrently.
+    pub fn new_for_session(app: &libadwaita::Application, session_path: &str) -> Self {
+        let window = Self::new(app);
+        window.inner.borrow_mut().forced_open = Some(session_path.to_string());
+        window
+    }
+
     pub fn present(&self) {
         self.inner.borrow().window.present();
     }
@@ -640,6 +659,30 @@ fn result_text(result: &Value) -> String {
         .get("content")
         .map(content_text)
         .unwrap_or_default()
+}
+
+/// Put the file content (write) or old/new blocks (edit) into the tool card
+/// body, so runs that change files show what actually changed.
+fn embed_tool_content(block: &chat::ToolBlock, tool_name: &str, args: Option<&Value>) {
+    let Some(args) = args else { return };
+    let name = tool_name.to_lowercase();
+    if name.contains("write") {
+        if let Some(content) = args.get("content").and_then(|c| c.as_str()) {
+            block.set_embedded_text(content);
+        }
+    } else if name.contains("edit") {
+        if let Some(edits) = args.get("edits").and_then(|e| e.as_array()) {
+            let pairs: Vec<(String, String)> = edits
+                .iter()
+                .filter_map(|e| {
+                    let old = e.get("oldText").and_then(|t| t.as_str())?.to_string();
+                    let new = e.get("newText").and_then(|t| t.as_str())?.to_string();
+                    Some((old, new))
+                })
+                .collect();
+            block.set_embedded_diff(&pairs);
+        }
+    }
 }
 
 /// Shorten a string to `max` chars (on the first line) for display.
@@ -731,8 +774,11 @@ impl State {
             let _ = self.rpc.send(PiCommand::Steer { message: trimmed });
             self.show_toast("Queued — sent when the current turn finishes");
         } else {
+            // New turn: the response draws one "Agent" header.
+            self.turn_header_shown = false;
             // Assistant streaming bubble.
-            let streaming = StreamingBubble::new();
+            let streaming = StreamingBubble::new(true);
+            self.turn_header_shown = true;
             self.chat_view.append(&streaming.container);
             self.streaming = Some(streaming);
             self.chat_view.scroll_to_bottom();
@@ -751,9 +797,29 @@ impl State {
         self.stop_button.set_sensitive(false);
     }
 
+    fn app_handle(&self) -> libadwaita::Application {
+        self.app.clone()
+    }
+
     fn on_switch_session(&mut self, id: &str) {
         if self.current_session_file.as_deref() == Some(id) {
             self.stack.set_visible_child_name("chat");
+            return;
+        }
+        if self.busy {
+            // Switching would interrupt the running agent — open the clicked
+            // session in a new window instead so both chats run at once.
+            let name = self
+                .sessions
+                .iter()
+                .find(|(f, _, _)| *f == id)
+                .map(|(_, n, _)| n.clone())
+                .unwrap_or_else(|| "session".into());
+            let window = PiWindow::new_for_session(&self.app_handle(), id);
+            window.present();
+            self.show_toast(&format!(
+                "Agent still running here — opened “{name}” in a new window"
+            ));
             return;
         }
         let Some(name) = self
@@ -919,6 +985,9 @@ impl State {
 
     fn render_messages(&self, messages: &Value) {
         let Some(arr) = messages.as_array() else { return };
+        // One "Agent" header per assistant run: it appears on the first
+        // assistant message after anything that is not an assistant message.
+        let mut prev_role: Option<String> = None;
         for msg in arr {
             let content = msg.get("content").cloned().unwrap_or_default();
             let text = content_text(&content);
@@ -935,13 +1004,16 @@ impl State {
                         view.grab_focus();
                     });
                     self.chat_view
-                        .append(&chat::user_message(&text, time, Some(on_edit)).box_)
+                        .append(&chat::user_message(&text, time, Some(on_edit)).box_);
+                    prev_role = Some("user".into());
                 }
                 Some("assistant") if !text.is_empty() || !thinking.is_empty() => {
                     let thinking = if thinking.is_empty() { None } else { Some(thinking.as_str()) };
+                    let with_header = prev_role.as_deref() != Some("assistant");
                     self.chat_view.append(
-                        &chat::assistant_message(&text, thinking, time).box_,
-                    )
+                        &chat::assistant_message(&text, thinking, time, with_header, None).box_,
+                    );
+                    prev_role = Some("assistant".into());
                 }
                 _ => {}
             }
@@ -1059,10 +1131,12 @@ impl State {
         // Thinking levels for the current model.
         self.pending_levels = Some(self.rpc.send(PiCommand::GetAvailableThinkingLevels));
 
-        // Test/deep-link hook: open a specific session once at startup.
+        // Test/deep-link hook: open a specific session once at startup. A
+        // forced session (new windows) takes precedence over the env var.
         if !self.auto_opened.get() {
             self.auto_opened.set(true);
-            if let Ok(target) = std::env::var("PI_GUI_OPEN_SESSION") {
+            let from_env = std::env::var("PI_GUI_OPEN_SESSION").ok();
+            if let Some(target) = self.forced_open.take().or(from_env) {
                 let known = self.sessions.iter().any(|(f, _, _)| *f == target);
                 if known && self.current_session_file.as_deref() != Some(target.as_str()) {
                     self.on_switch_session(&target);
@@ -1168,7 +1242,11 @@ impl State {
             PiEvent::Response { .. } => {}
             PiEvent::MessageStart { message } => {
                 if message.as_ref().and_then(message_role) == Some("assistant") {
-                    self.ensure_streaming();
+                    let with_header = !self.turn_header_shown;
+                    self.ensure_streaming(with_header);
+                    if with_header {
+                        self.turn_header_shown = true;
+                    }
                 }
             }
             PiEvent::MessageUpdate { event } => self.handle_message_update(event.as_ref()),
@@ -1187,6 +1265,7 @@ impl State {
                 let name = tool_name.clone().unwrap_or_else(|| "tool".into());
                 let summary = tool_summary(args.as_ref());
                 let block = ToolBlock::new(&name, &summary);
+                embed_tool_content(&block, &name, args.as_ref());
                 self.chat_view.append(&block.box_);
                 if let Some(id) = tool_call_id {
                     self.tool_blocks.insert(id.clone(), block);
@@ -1197,7 +1276,11 @@ impl State {
                 let text = partial_result.as_ref().map(result_text).unwrap_or_default();
                 if let (Some(id), false) = (tool_call_id, text.is_empty()) {
                     if let Some(block) = self.tool_blocks.get(id) {
-                        block.set_content(&text);
+                        if block.is_embedded() {
+                            block.append_result(&text);
+                        } else {
+                            block.set_content(&text);
+                        }
                     }
                 }
             }
@@ -1206,7 +1289,11 @@ impl State {
                 if let Some(id) = tool_call_id {
                     if let Some(block) = self.tool_blocks.get(id) {
                         if !text.is_empty() {
-                            block.set_content(&text);
+                            if block.is_embedded() {
+                                block.append_result(&text);
+                            } else {
+                                block.set_content(&text);
+                            }
                         }
                         block.set_finished(*is_error == Some(true));
                     }
@@ -1221,7 +1308,7 @@ impl State {
                         .as_deref()
                         .map(|s| shorten_for_display(s, 80))
                         .unwrap_or_default();
-                    self.ensure_streaming();
+                    self.ensure_streaming(true);
                     if let Some(streaming) = self.streaming.as_ref() {
                         streaming.show_retry(*attempt, &reason);
                     }
@@ -1275,9 +1362,12 @@ impl State {
     fn handle_message_update(&mut self, event: Option<&Value>) {
         let Some(event) = event else { return };
         match event.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "text_start" => {
+                self.ensure_streaming(!self.turn_header_shown);
+            }
             "text_delta" => {
                 if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
-                    self.ensure_streaming();
+                    self.ensure_streaming(!self.turn_header_shown);
                     if let Some(streaming) = self.streaming.as_ref() {
                         streaming.append_text(delta);
                     }
@@ -1286,7 +1376,7 @@ impl State {
             }
             "thinking_delta" => {
                 if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
-                    self.ensure_streaming();
+                    self.ensure_streaming(!self.turn_header_shown);
                     if let Some(streaming) = self.streaming.as_ref() {
                         streaming.append_thinking(delta);
                     }
@@ -1304,6 +1394,7 @@ impl State {
                 if let Some(content) = event.get("content").and_then(|c| c.as_str()) {
                     if let Some(streaming) = self.streaming.as_ref() {
                         streaming.set_thinking(content);
+                        streaming.finish_thinking();
                     }
                 }
             }
@@ -1315,9 +1406,14 @@ impl State {
         }
     }
 
-    fn ensure_streaming(&mut self) {
+    /// Make sure a streaming bubble exists, drawing the turn header on its
+    /// first row only; remember that the turn's header was drawn.
+    fn ensure_streaming(&mut self, with_header: bool) {
         if self.streaming.is_none() {
-            let streaming = StreamingBubble::new();
+            let streaming = StreamingBubble::new(with_header);
+            if with_header {
+                self.turn_header_shown = true;
+            }
             self.chat_view.append(&streaming.container);
             self.streaming = Some(streaming);
             self.chat_view.scroll_to_bottom();
@@ -1336,6 +1432,8 @@ impl State {
                     text,
                     if thinking.is_empty() { None } else { Some(thinking) },
                     None,
+                    streaming.has_header,
+                    streaming.thought_secs(),
                 );
                 // Insert at the streaming bubble's position so tool blocks
                 // that already followed it stay in order.
