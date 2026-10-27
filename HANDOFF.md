@@ -1,7 +1,8 @@
 # pi-gui — HANDOFF
 
-State as of 2026-10-26. The "still broken" round is **fixed and visually
-verified**; changes are committed. Read this before touching the code.
+State as of 2026-10-26 (evening). Two rounds committed: the layout/retry fixes and
+the feedback batch (spinners, gear, toast pruning, multi-window, edit, loading
+states). Read this before touching the code.
 
 ## What this is
 
@@ -15,43 +16,55 @@ reasoning, tool cards), no web stack.
   handling), `src/rpc.rs` (child process + JSONL protocol), `src/chat.rs` (transcript
   widgets), `src/session_list.rs` (sidebar), `src/style.rs` (all CSS)
 
-## Commit state
+## Feature batch #2 (2026-10-26 evening) — all implemented
 
-```
-<see git log>  fix(ui): chat layout alignment and provider-retry visibility  <- this round
-676dab8 fix(rpc): register pending response sender before writing the request
-dba4ab9 feat(ui): redesign transcript, sidebar, header, and input to HIG quality
-2ada722 fix(rpc): deliver commands to pi without waiting for output
-3be2048 feat: working GTK4/libadwaita GUI for the pi coding agent
-```
+1. **Working indicator** — spinner in the header title (visible while the agent
+   runs) AND the running session's sidebar row swaps its file icon for a spinner.
+   Wired in AgentStart / AgentSettled / Disconnected.
+2. **Settings gear** — `emblem-system-symbolic` (the gear); the previous
+   `preferences-system-symbolic` renders as a star-ish icon in current GNOME.
+3. **Toast pruning** — removed per-retry toasts (persistent status line covers it),
+   provider-error toast (error row covers it), "Stopped", "New chat started",
+   "Model: …". Remaining toasts are failure paths only (RPC died, switch cancelled,
+   no models, extension errors) plus extension-initiated notifies.
+4. **Multi-session at once** — "New window" header button (window-new-symbolic) +
+   every `pi-gui` launch opens an additional window. Each window owns its pi RPC
+   child, sidebar and state (GtkApplication single-instance: new launches hand off
+   via activate → new window in the primary process). Verified: two windows, two
+   fake-pi children, independent sessions.
+   NOTE: env hooks (PI_GUI_OPEN_SESSION) of the SECOND process do not reach the
+   primary's new window (env is read by the primary) — per-window options need a
+   different IPC if ever needed.
+5. **Edit messages** — hovering a user bubble reveals a pencil button left of it
+   (EventControllerMotion); clicking prefills the input with the message text and
+   focuses it. Re-sending appends a NEW message (pi's RPC has no history-truncation
+   command; true edit-and-branch needs pi support).
+6. **Slow session load feedback** — "Loading messages…" spinner row in the cleared
+   transcript while switch_session/get_messages run; "Starting pi…" subtitle while
+   the first get_state warms up; `[timing]` stderr logs measure switch → render.
+   MEASURED (real pi, 340KB / 102-message session): get_state 10.2s (pi startup:
+   provider/extension discovery), switch_session 6.6s (pi re-parses the session),
+   get_messages 0.01s, GUI render ~0-1ms. The slowness is ALL pi-side; the GUI just
+   needed to show progress instead of a blank screen.
 
-## What this round fixed (all visually verified on broadway)
+## Previous round (2026-10-25/26) — root causes + verification
 
 1. **User bubble left-aligned** — `halign(End)` without `hexpand` is a no-op inside a
    horizontal GTK Box. Fix: `spacer()` (an `hexpand(true)` Box) before the bubble in
    `chat.rs::user_message`. ✅ Verified.
-2. **Assistant header floated mid-row** — ROOT CAUSE FOUND: the π label inside the
+2. **Assistant header floated mid-row** — ROOT CAUSE: the π label inside the
    avatar circle had `hexpand(true)`. GTK's `compute_expand` leaks a child's expand
    flag up through its container, so the avatar circle counted as an expanding child
-   of the header row and swallowed ~50% of the row's spare width (pushing "pi · time"
-   to the center; the leaked pill background was invisible at 16% opacity).
-   Fix: avatar labels use `halign(Center)` and NO hexpand (also the welcome avatar,
-   which rendered as a 393px pill for the same reason + missing halign on the circle).
-   ✅ Verified: "π pi · HH:MM" hugs the left edge everywhere.
+   of the header row and swallowed ~50% of the row's spare width (the leaked pill
+   background was invisible at 16% opacity). Fix: avatar labels use `halign(Center)`
+   and NO hexpand (also the welcome avatar, which rendered as a 393px pill).
    Debug technique that cracked it: temporary CSS classes with loud background colors
    on each header child — the blue spacer occupied only the last third, proving the
    avatar itself was the invisible wide widget.
 3. **Eternal "Thinking…" on provider errors** — pi retries provider 5xx silently;
-   only vanishing toots indicated anything. Now:
-   - `StreamingBubble::show_retry(attempt, reason)` — persistent spinner + status
-     "Retrying (attempt N) — <error>" in the streaming bubble. ✅ Verified.
-   - `AutoRetryEnd success=true` → `retry_done()` restores "Thinking…"/hides.
-   - `AutoRetryEnd success=false` → `chat::error_message()` appends a persistent red
-     warning row (`.error-row` CSS) to the transcript. ✅ Verified
-     ("Provider error after retries: … 502 Bad Gateway"), survives AgentSettled.
-4. **`PI_GUI_OPEN_SESSION=<path>` env hook** — auto-opens a session after the first
-   state load. Added for keyboard-free testing (broadway keyboard is dead), also
-   useful as a deep-link feature later.
+   now: `StreamingBubble::show_retry(attempt, reason)` persistent status line,
+   `retry_done()` on success, and `chat::error_message()` red row on final failure
+   (survives AgentSettled). ✅ Both states verified on broadway.
 
 All 3 `cargo test --release` tests green (wire-format round trips + the
 write-starvation regression test).
