@@ -17,7 +17,7 @@ use gtk4::{
 use libadwaita::prelude::*;
 use libadwaita::{
     ComboRow, HeaderBar, MessageDialog, PreferencesGroup, PreferencesPage, PreferencesWindow,
-    SwitchRow, Toast, WindowTitle,
+    SwitchRow, TabBar, TabPage, TabView, WindowTitle,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -54,34 +54,20 @@ impl ModelInfo {
 /// Main-flow command whose response we are waiting on.
 enum Pending {
     None,
-    NewSession(Receiver<Value>),
     Prompt(Receiver<Value>),
     SwitchSession(Receiver<Value>),
     GetMessages(Receiver<Value>),
 }
 
-struct State {
+/// One open chat: its own pi RPC child, transcript, and streaming state.
+/// Multiple ChatSessions live in one window as tabs and run concurrently.
+struct ChatSession {
     rpc: PiRpcClient,
     events: PiEventStream,
 
-    window: gtk4::ApplicationWindow,
-    stack: Stack,
     chat_view: ChatView,
-    session_list: SessionList,
-
-    window_title: WindowTitle,
-    busy_spinner: Spinner,
-    model_dropdown: DropDown,
-
-    all_models: Vec<ModelInfo>,
-    filtered_models: Vec<ModelInfo>,
-    current_model_label: Option<String>,
-
-    input_view: TextView,
-    input_buffer: gtk4::TextBuffer,
-    input_placeholder: Label,
-    send_button: Button,
-    stop_button: Button,
+    /// Placeholder shown in the transcript while a resumed session loads.
+    loading_row: gtk4::Box,
 
     streaming: Option<StreamingBubble>,
     tool_blocks: HashMap<String, ToolBlock>,
@@ -105,28 +91,108 @@ struct State {
     session_named: bool,
 
     current_session_file: Option<String>,
-    sessions: Vec<(String, String, String)>, // (file path, display name, time label)
 
-    suppress_model_signal: Rc<Cell<bool>>,
-    suppress_thinking_signal: Rc<Cell<bool>>,
     suppress_autocompact: Rc<Cell<bool>>,
-    /// PI_GUI_OPEN_SESSION auto-open runs once, on the first state load.
-    auto_opened: Cell<bool>,
 
-    /// Placeholder shown in the transcript while a resumed session loads.
-    loading_row: gtk4::Box,
     /// When the current session switch started (for stderr timing logs).
     switch_started: Option<std::time::Instant>,
-
-    /// Session to open automatically on the first state load (new windows).
-    forced_open: Option<String>,
-
-    /// Application handle, for spawning additional windows.
-    app: libadwaita::Application,
 
     thinking_levels: Vec<String>,
     current_thinking_level: Option<String>,
 
+    /// The tab page this chat renders into.
+    page: TabPage,
+}
+
+impl ChatSession {
+    fn new(tabs: &TabView) -> Self {
+        let (rpc, events) = crate::rpc::spawn().expect("failed to start pi RPC");
+
+        let chat_view = ChatView::new();
+        let loading_spinner = Spinner::new();
+        loading_spinner.start();
+        let loading_label = Label::new(Some("Loading messages…"));
+        loading_label.add_css_class("loading-label");
+        let loading_inner = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(10)
+            .halign(Align::Center)
+            .valign(Align::Start)
+            .margin_top(24)
+            .build();
+        loading_inner.append(&loading_spinner);
+        loading_inner.append(&loading_label);
+        let loading_row = Box::builder()
+            .orientation(Orientation::Vertical)
+            .hexpand(true)
+            .valign(Align::Start)
+            .build();
+        loading_row.append(&loading_inner);
+        loading_row.set_visible(false);
+
+        // The tab shows just the transcript; the input bar below the tab bar
+        // is shared and acts on the selected tab.
+        let page = tabs.append(&chat_view.scrolled);
+        page.set_title("New chat");
+
+        Self {
+            rpc,
+            events,
+            chat_view,
+            loading_row,
+            streaming: None,
+            tool_blocks: HashMap::new(),
+            turn_header_shown: false,
+            file_cache: HashMap::new(),
+            tool_meta: HashMap::new(),
+            pending: Pending::None,
+            pending_models: None,
+            pending_state: None,
+            pending_levels: None,
+            busy: false,
+            session_named: false,
+            current_session_file: None,
+            suppress_autocompact: Rc::new(Cell::new(false)),
+            switch_started: None,
+            thinking_levels: Vec::new(),
+            current_thinking_level: None,
+            page,
+        }
+    }
+}
+
+struct State {
+    window: gtk4::ApplicationWindow,
+    /// The per-session tabs; each tab owns a ChatSession with its own pi child.
+    tabs: TabView,
+    /// Open chats keyed by an internal id (stable across page lookups).
+    chats: HashMap<String, ChatSession>,
+    /// Insertion order of chat ids, for event polling.
+    chat_order: Vec<String>,
+    /// The chat the input area and header act on.
+    active: Option<String>,
+
+    stack: Stack,
+    session_list: SessionList,
+    /// Window-level session discovery: (file path, display name, time label).
+    sessions: Vec<(String, String, String)>,
+
+    window_title: WindowTitle,
+    busy_spinner: Spinner,
+    model_dropdown: DropDown,
+    all_models: Vec<ModelInfo>,
+    filtered_models: Vec<ModelInfo>,
+    current_model_label: Option<String>,
+    /// The model selection is applied to the active chat's pi child.
+    suppress_model_signal: Rc<Cell<bool>>,
+
+    input_view: TextView,
+    input_buffer: gtk4::TextBuffer,
+    input_placeholder: Label,
+    send_button: Button,
+    stop_button: Button,
+
+    suppress_thinking_signal: Rc<Cell<bool>>,
     thinking_combo_row: ComboRow,
     autoswitch_row: SwitchRow,
 }
@@ -137,7 +203,6 @@ pub struct PiWindow {
 
 impl PiWindow {
     pub fn new(app: &libadwaita::Application) -> Self {
-        let (rpc, events) = crate::rpc::spawn().expect("failed to start pi RPC");
         let window = gtk4::ApplicationWindow::builder()
             .application(app)
             .default_width(1100)
@@ -295,7 +360,7 @@ impl PiWindow {
             .vexpand(true)
             .build();
 
-        // Chat page
+        // Chat page: tab bar + per-session transcripts, shared input below.
         let chat_page = Box::builder()
             .orientation(Orientation::Vertical)
             .hexpand(true)
@@ -303,31 +368,12 @@ impl PiWindow {
             .css_classes(["chat-page"])
             .build();
 
-        let chat_view = ChatView::new();
-        chat_page.append(&chat_view.scrolled);
-
-        // "Loading" placeholder shown while a resumed session's messages are
-        // fetched and rendered (big sessions can take a moment).
-        let loading_spinner = Spinner::new();
-        loading_spinner.start();
-        let loading_label = Label::new(Some("Loading messages…"));
-        loading_label.add_css_class("loading-label");
-        let loading_inner = Box::builder()
-            .orientation(Orientation::Horizontal)
-            .spacing(10)
-            .halign(Align::Center)
-            .valign(Align::Start)
-            .margin_top(24)
-            .build();
-        loading_inner.append(&loading_spinner);
-        loading_inner.append(&loading_label);
-        let loading_row = Box::builder()
-            .orientation(Orientation::Vertical)
-            .hexpand(true)
-            .valign(Align::Start)
-            .build();
-        loading_row.append(&loading_inner);
-        loading_row.set_visible(false);
+        let tabs = TabView::new();
+        let tab_bar = TabBar::new();
+        tab_bar.set_view(Some(&tabs));
+        tab_bar.set_hexpand(true);
+        chat_page.append(&tab_bar);
+        chat_page.append(&tabs);
 
         // Input area: rounded card with a multiline entry, circular send and
         // stop buttons. Enter sends, Shift+Enter inserts a newline.
@@ -402,53 +448,31 @@ impl PiWindow {
         main_box.append(&separator);
         main_box.append(&stack);
 
-        let overlay = chat_view.overlay.clone();
-        overlay.set_child(Some(&main_box));
-
-        window.set_child(Some(&overlay));
+        window.set_child(Some(&main_box));
 
         // ================= State =================
         let state = Rc::new(RefCell::new(State {
-            rpc,
-            events,
             window,
+            tabs,
+            chats: HashMap::new(),
+            chat_order: Vec::new(),
+            active: None,
             stack,
-            chat_view,
             session_list,
+            sessions: Vec::new(),
             window_title,
             busy_spinner,
             model_dropdown,
             all_models: Vec::new(),
             filtered_models: Vec::new(),
             current_model_label: None,
+            suppress_model_signal: Rc::new(Cell::new(false)),
             input_view,
             input_buffer,
             input_placeholder,
             send_button,
             stop_button,
-            streaming: None,
-            tool_blocks: HashMap::new(),
-            turn_header_shown: false,
-            file_cache: HashMap::new(),
-            tool_meta: HashMap::new(),
-            pending: Pending::None,
-            pending_models: None,
-            pending_state: None,
-            pending_levels: None,
-            busy: false,
-            session_named: false,
-            current_session_file: None,
-            sessions: Vec::new(),
-            suppress_model_signal: Rc::new(Cell::new(false)),
             suppress_thinking_signal: Rc::new(Cell::new(false)),
-            suppress_autocompact: Rc::new(Cell::new(false)),
-            auto_opened: Cell::new(false),
-            loading_row,
-            switch_started: None,
-            forced_open: None,
-            app: app.clone(),
-            thinking_levels: Vec::new(),
-            current_thinking_level: None,
             thinking_combo_row,
             autoswitch_row,
         }));
@@ -521,7 +545,7 @@ impl PiWindow {
 
         let s = state.clone();
         let cb = Rc::new(move |id: &str| {
-            s.borrow_mut().on_switch_session(id);
+            s.borrow_mut().open_session_tab(id);
         });
         state.borrow().session_list.set_on_selected(cb);
 
@@ -533,36 +557,82 @@ impl PiWindow {
                 return;
             }
             let idx = row.selected() as usize;
-            if let Ok(st) = s.try_borrow() {
-                if let Some(level) = st.thinking_levels.get(idx).cloned() {
-                    drop(st);
-                    if let Ok(mut st) = s.try_borrow_mut() {
-                        st.set_thinking_level(level);
-                    }
+            if let Ok(mut st) = s.try_borrow_mut() {
+                let level = st
+                    .active_chat()
+                    .and_then(|c| c.thinking_levels.get(idx).cloned());
+                if let Some(level) = level {
+                    st.set_thinking_level(level);
                 }
             }
         });
 
         let s = state.clone();
-        let suppress = s.borrow().suppress_autocompact.clone();
         let switch = s.borrow().autoswitch_row.clone();
         switch.connect_active_notify(move |row| {
-            if suppress.get() {
-                return;
-            }
             let enabled = row.is_active();
-            if let Ok(st) = s.try_borrow_mut() {
-                let _ = st.rpc.send(PiCommand::SetAutoCompaction { enabled });
+            if let Ok(mut st) = s.try_borrow_mut() {
+                // Programmatic row updates happen while the active chat's
+                // suppress flag is up; only forward user changes.
+                if st.active_chat().is_some_and(|c| c.suppress_autocompact.get()) {
+                    return;
+                }
+                if let Some(chat) = st.active_chat() {
+                    let _ = chat.rpc.send(PiCommand::SetAutoCompaction { enabled });
+                }
             }
         });
+
+        // Tab lifecycle: closing a tab kills that chat's pi child; selection
+        // switches the input area and header to the chosen chat.
+        {
+            let st = state.clone();
+            state.borrow().tabs.connect_close_page(move |view, page| {
+                if let Ok(mut s) = st.try_borrow_mut() {
+                    s.close_chat(page);
+                }
+                view.close_page_finish(page, true);
+                glib::Propagation::Stop
+            });
+        }
+        {
+            let st = state.clone();
+            state.borrow().tabs.connect_selected_page_notify(move |_| {
+                if let Ok(mut s) = st.try_borrow_mut() {
+                    s.sync_active_from_tabs();
+                }
+            });
+        }
 
         // ================= Kick off =================
 
         {
             let mut st = state.borrow_mut();
             st.load_disk_sessions();
-            st.pending_state = Some((st.rpc.send(PiCommand::GetState), false));
-            st.pending_models = Some(st.rpc.send(PiCommand::GetAvailableModels));
+            // Open the env-specified session(s) — a ';'-separated list opens
+            // one tab per session (tests use this to get several tabs without
+            // clicks); with none set the first tab shows the pi child's
+            // current session.
+            let targets: Vec<String> = std::env::var("PI_GUI_OPEN_SESSION")
+                .map(|v| {
+                    v.split(';')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let known: Vec<String> = targets
+                .into_iter()
+                .filter(|t| st.sessions.iter().any(|(path, _, _)| path == t))
+                .collect();
+            if known.is_empty() {
+                st.create_chat_tab(None);
+            } else {
+                for target in &known {
+                    st.create_chat_tab(Some(target.as_str()));
+                }
+            }
         }
 
         // Main-loop polling of RPC events and command responses. This is the
@@ -576,15 +646,6 @@ impl PiWindow {
         });
 
         Self { inner: state }
-    }
-
-    /// A window that auto-opens `session_path` once its state loads — used
-    /// when the user clicks a session while another agent is still running,
-    /// so both chats run concurrently.
-    pub fn new_for_session(app: &libadwaita::Application, session_path: &str) -> Self {
-        let window = Self::new(app);
-        window.inner.borrow_mut().forced_open = Some(session_path.to_string());
-        window
     }
 
     pub fn present(&self) {
@@ -676,7 +737,7 @@ fn embed_tool_content(
     block: &chat::ToolBlock,
     tool_name: &str,
     args: Option<&Value>,
-    state: &State,
+    chat: &ChatSession,
 ) {
     let Some(args) = args else { return };
     let name = tool_name.to_lowercase();
@@ -685,7 +746,7 @@ fn embed_tool_content(
         let old = args
             .get("path")
             .and_then(|p| p.as_str())
-            .and_then(|path| state.file_cache.get(path).cloned());
+            .and_then(|path| chat.file_cache.get(path).cloned());
         let rows = old.and_then(|old| chat::diff_numbered(&old, content, 1, 1));
         match rows {
             Some(rows) => block.set_embedded_diff(&rows),
@@ -696,7 +757,7 @@ fn embed_tool_content(
         let file = args
             .get("path")
             .and_then(|p| p.as_str())
-            .and_then(|path| state.file_cache.get(path).cloned());
+            .and_then(|path| chat.file_cache.get(path).cloned());
         let mut rows: Vec<chat::DiffLine> = Vec::new();
         for edit in edits {
             let Some(old) = edit.get("oldText").and_then(|t| t.as_str()) else { continue };
@@ -762,21 +823,157 @@ fn shorten_for_display(text: &str, max: usize) -> String {
 // ================= state actions =================
 
 impl State {
-    fn on_new_chat(&mut self) {
-        self.stack.set_visible_child_name("chat");
-        self.chat_view.clear();
-        self.streaming = None;
-        self.tool_blocks.clear();
-        self.current_session_file = None;
-        self.session_named = false;
-        self.busy = false;
-        self.window_title.set_title("New chat");
-        self.window_title.set_subtitle("Start a conversation");
-        self.stop_button.set_sensitive(false);
-        self.input_view.grab_focus();
+    // ================= chat tab management =================
 
-        let receiver = self.rpc.send(PiCommand::NewSession { parent_session: None });
-        self.pending = Pending::NewSession(receiver);
+    fn active_chat(&mut self) -> Option<&mut ChatSession> {
+        let id = self.active.clone()?;
+        self.chats.get_mut(&id)
+    }
+
+    /// Open a new chat tab with its own pi child. `session_path` resumes that
+    /// session right away; None starts a fresh chat.
+    fn create_chat_tab(&mut self, session_path: Option<&str>) {
+        let chat = ChatSession::new(&self.tabs);
+        let id = format!("chat-{:03}", self.chat_order.len());
+        chat.page.set_loading(true);
+        self.tabs.set_selected_page(&chat.page);
+        self.chats.insert(id.clone(), chat);
+        self.chat_order.push(id.clone());
+        self.active = Some(id.clone());
+        self.stack.set_visible_child_name("chat");
+
+        // Load this child's state, models and thinking levels.
+        let chat = self.chats.get_mut(&id).expect("just inserted");
+        chat.pending_state = Some((chat.rpc.send(PiCommand::GetState), false));
+        chat.pending_models = Some(chat.rpc.send(PiCommand::GetAvailableModels));
+        chat.pending_levels = Some(chat.rpc.send(PiCommand::GetAvailableThinkingLevels));
+
+        if let Some(path) = session_path {
+            self.switch_active_chat_to(path);
+        }
+        self.refresh_chat_ui();
+        self.input_view.grab_focus();
+    }
+
+    /// Point the active (fresh) chat at an existing session file.
+    fn switch_active_chat_to(&mut self, id: &str) {
+        let Some(name) =
+            self.sessions.iter().find(|(f, _, _)| *f == id).map(|(_, n, _)| n.clone())
+        else {
+            return;
+        };
+        let Some(chat) = self.active_chat() else { return };
+        chat.current_session_file = Some(id.to_string());
+        chat.session_named = true;
+        chat.page.set_title(&name);
+        chat.chat_view.clear();
+        chat.chat_view.append(&chat.loading_row);
+        chat.loading_row.set_visible(true);
+        chat.switch_started = Some(std::time::Instant::now());
+        let receiver = chat.rpc.send(PiCommand::SwitchSession { session_path: id.to_string() });
+        chat.pending = Pending::SwitchSession(receiver);
+    }
+
+    /// Session list click: focus the tab already showing that session, or
+    /// open it in a new tab. Running chats are never interrupted.
+    fn open_session_tab(&mut self, id: &str) {
+        let open_chat = self
+            .chats
+            .iter()
+            .find(|(_, c)| c.current_session_file.as_deref() == Some(id))
+            .map(|(cid, _)| cid.clone());
+        if let Some(cid) = open_chat {
+            if let Some(chat) = self.chats.get(&cid) {
+                self.tabs.set_selected_page(&chat.page);
+            }
+            self.stack.set_visible_child_name("chat");
+            return;
+        }
+        // A fresh chat with no history yet can adopt the session in place.
+        let empty_active = self
+            .active_chat()
+            .is_some_and(|c| c.current_session_file.is_none() && !c.busy);
+        self.stack.set_visible_child_name("chat");
+        if empty_active {
+            self.switch_active_chat_to(id);
+            self.refresh_chat_ui();
+        } else {
+            self.create_chat_tab(Some(id));
+        }
+    }
+
+    fn close_chat(&mut self, page: &TabPage) {
+        let Some(id) = self
+            .chats
+            .iter()
+            .find(|(_, c)| c.page == *page)
+            .map(|(id, _)| id.clone())
+        else {
+            return;
+        };
+        // Dropping the ChatSession closes the RPC channel, which exits the pi
+        // child.
+        self.chats.remove(&id);
+        self.chat_order.retain(|c| *c != id);
+        if self.active.as_deref() == Some(id.as_str()) {
+            self.active = self.chat_order.last().cloned();
+        }
+        if self.chats.is_empty() {
+            self.stack.set_visible_child_name("welcome");
+        }
+        self.refresh_chat_ui();
+    }
+
+    /// Re-read the selected tab and sync the shared UI to it.
+    fn sync_active_from_tabs(&mut self) {
+        let selected = self.tabs.selected_page();
+        let id = self
+            .chats
+            .iter()
+            .find(|(_, c)| Some(&c.page) == selected.as_ref())
+            .map(|(id, _)| id.clone());
+        self.active = id.or_else(|| self.chat_order.last().cloned());
+        self.refresh_chat_ui();
+        self.input_view.grab_focus();
+    }
+
+    /// Push the active chat's state into the shared widgets (title, spinner,
+    /// stop button, sidebar highlight).
+    fn refresh_chat_ui(&mut self) {
+        let active = self.active.clone().and_then(|id| self.chats.get(&id));
+        match active {
+            Some(chat) => {
+                self.window_title.set_title(&chat.page.title());
+                self.window_title.set_subtitle(if chat.busy {
+                    "Working…"
+                } else {
+                    "Idle"
+                });
+                self.stop_button.set_sensitive(chat.busy);
+                if let Some(file) = &chat.current_session_file {
+                    self.session_list.set_active(file);
+                }
+            }
+            None => {
+                self.window_title.set_title("pi");
+                self.window_title.set_subtitle("GNOME AI coding assistant");
+                self.stop_button.set_sensitive(false);
+            }
+        }
+        let any_busy = self.chats.values().any(|c| c.busy);
+        if any_busy {
+            self.busy_spinner.start();
+            self.busy_spinner.set_visible(true);
+        } else {
+            self.busy_spinner.stop();
+            self.busy_spinner.set_visible(false);
+        }
+    }
+
+    // ================= actions =================
+
+    fn on_new_chat(&mut self) {
+        self.create_chat_tab(None);
     }
 
     fn input_text(&self) -> String {
@@ -790,12 +987,11 @@ impl State {
         if trimmed.is_empty() {
             return;
         }
+        let Some(id) = self.active.clone() else { return };
         self.input_buffer.set_text("");
-
         self.stack.set_visible_child_name("chat");
 
-        // User bubble.
-        let time = chat::now_time();
+        // User bubble (in the active chat's transcript).
         let buffer = self.input_buffer.clone();
         let view = self.input_view.clone();
         let sent = trimmed.clone();
@@ -803,164 +999,117 @@ impl State {
             buffer.set_text(&sent);
             view.grab_focus();
         });
-        self.chat_view
-            .append(&chat::user_message(&trimmed, Some(&time), Some(on_edit)).box_);
 
-        // Name the session after the first user message.
-        if !self.session_named {
-            if let Some(file) = self.current_session_file.clone() {
-                let name = shorten_for_display(&trimmed, 48);
-                if !name.is_empty() {
-                    let _ = self.rpc.send(PiCommand::SetSessionName { name: name.clone() });
-                    self.session_list.rename_session(&file, &name);
-                    self.window_title.set_title(&name);
-                    if let Some(entry) =
-                        self.sessions.iter_mut().find(|(f, _, _)| *f == file)
-                    {
-                        entry.1 = name;
+        let session_named_info = {
+            let Some(chat) = self.chats.get_mut(&id) else { return };
+            let time = chat::now_time();
+            let bubble = chat::user_message(&trimmed, Some(&time), Some(on_edit));
+            chat.chat_view.append(&bubble.box_);
+
+            // Name the session after the first user message.
+            let mut renamed = None;
+            if !chat.session_named {
+                if let Some(file) = chat.current_session_file.clone() {
+                    let name = shorten_for_display(&trimmed, 48);
+                    if !name.is_empty() {
+                        let _ = chat.rpc.send(PiCommand::SetSessionName { name: name.clone() });
+                        renamed = Some((file, name));
                     }
+                    chat.session_named = true;
                 }
-                self.session_named = true;
+            }
+            renamed
+        };
+
+        if let Some((file, name)) = session_named_info {
+            self.session_list.rename_session(&file, &name);
+            if let Some(entry) = self.sessions.iter_mut().find(|(f, _, _)| *f == file) {
+                entry.1 = name.clone();
+            }
+            if let Some(chat) = self.chats.get(&id) {
+                chat.page.set_title(&name);
             }
         }
 
-        if self.busy {
+        let Some(chat) = self.chats.get_mut(&id) else { return };
+        if chat.busy {
             // The agent is already running: queue a steering message that is
             // delivered after the current assistant turn finishes its tool
             // calls.
-            let _ = self.rpc.send(PiCommand::Steer { message: trimmed });
-            self.show_toast("Queued — sent when the current turn finishes");
+            let _ = chat.rpc.send(PiCommand::Steer { message: trimmed });
+            eprintln!("[pi-gui] message queued — sent when the current turn finishes");
         } else {
             // New turn: the response draws one "Agent" header.
-            self.turn_header_shown = false;
-            // Assistant streaming bubble.
+            chat.turn_header_shown = false;
             let streaming = StreamingBubble::new(true);
-            self.turn_header_shown = true;
-            self.chat_view.append(&streaming.container);
-            self.streaming = Some(streaming);
-            self.chat_view.scroll_to_bottom();
+            chat.turn_header_shown = true;
+            chat.chat_view.append(&streaming.container);
+            chat.streaming = Some(streaming);
+            chat.chat_view.scroll_to_bottom();
 
-            self.busy = true;
-            self.stop_button.set_sensitive(true);
-            self.window_title.set_subtitle("Working…");
-
-            let receiver = self.rpc.send(PiCommand::Prompt { message: trimmed });
-            self.pending = Pending::Prompt(receiver);
+            chat.busy = true;
+            chat.page.set_loading(true);
+            let receiver = chat.rpc.send(PiCommand::Prompt { message: trimmed });
+            chat.pending = Pending::Prompt(receiver);
         }
+        self.refresh_chat_ui();
     }
 
     fn on_stop(&mut self) {
-        let _ = self.rpc.send(PiCommand::Abort);
-        self.stop_button.set_sensitive(false);
-    }
-
-    fn app_handle(&self) -> libadwaita::Application {
-        self.app.clone()
-    }
-
-    fn on_switch_session(&mut self, id: &str) {
-        if self.current_session_file.as_deref() == Some(id) {
-            self.stack.set_visible_child_name("chat");
-            return;
+        if let Some(chat) = self.active_chat() {
+            if chat.busy {
+                let _ = chat.rpc.send(PiCommand::Abort);
+            }
         }
-        if self.busy {
-            // Switching would interrupt the running agent — open the clicked
-            // session in a new window instead so both chats run at once.
-            let name = self
-                .sessions
-                .iter()
-                .find(|(f, _, _)| *f == id)
-                .map(|(_, n, _)| n.clone())
-                .unwrap_or_else(|| "session".into());
-            let window = PiWindow::new_for_session(&self.app_handle(), id);
-            window.present();
-            self.show_toast(&format!(
-                "Agent still running here — opened “{name}” in a new window"
-            ));
-            return;
-        }
-        let Some(name) = self
-            .sessions
-            .iter()
-            .find(|(f, _, _)| *f == id)
-            .map(|(_, n, _)| n.clone())
-        else {
-            return;
-        };
-
-        self.current_session_file = Some(id.to_string());
-        self.session_named = true;
-        self.window_title.set_title(&name);
-        self.window_title.set_subtitle("Loading…");
-        self.stack.set_visible_child_name("chat");
-        self.chat_view.clear();
-        self.chat_view.append(&self.loading_row);
-        self.loading_row.set_visible(true);
-        self.switch_started = Some(std::time::Instant::now());
-        self.streaming = None;
-        self.tool_blocks.clear();
-        self.session_list.set_active(id);
-        self.input_view.grab_focus();
-
-        let receiver = self.rpc.send(PiCommand::SwitchSession { session_path: id.to_string() });
-        self.pending = Pending::SwitchSession(receiver);
     }
 
     // ================= event/response polling =================
 
     fn poll_events(&mut self) {
-        // Drain async events first.
-        while let Some(event) = self.events.try_event() {
-            self.handle_event(&event);
+        // Each chat owns a pi child; pump every one of them. Taking the chat
+        // out of the map keeps borrows disjoint while handling events.
+        let ids = self.chat_order.clone();
+        for id in ids {
+            let Some(mut chat) = self.chats.remove(&id) else { continue };
+            while let Some(event) = chat.events.try_event() {
+                self.handle_event(&id, &mut chat, &event);
+            }
+            self.poll_chat_pending(&id, &mut chat);
+            self.chats.insert(id, chat);
         }
+    }
 
-        if let Some(recv) = self.pending_models.take() {
+    fn poll_chat_pending(&mut self, id: &str, chat: &mut ChatSession) {
+        if let Some(recv) = chat.pending_models.take() {
             match recv.try_recv() {
-                Ok(value) => self.load_models_done(&value),
-                Err(TryRecvError::Empty) => self.pending_models = Some(recv),
-                Err(TryRecvError::Disconnected) => self.show_toast("Model list unavailable"),
+                Ok(value) => self.load_models_done(id, chat, &value),
+                Err(TryRecvError::Empty) => chat.pending_models = Some(recv),
+                Err(TryRecvError::Disconnected) => {
+                    eprintln!("[pi-gui] model list unavailable (chat {id})")
+                }
             }
         }
 
-        if let Some((recv, after_new)) = self.pending_state.take() {
+        if let Some((recv, after_new)) = chat.pending_state.take() {
             match recv.try_recv() {
-                Ok(value) => self.load_state_done(&value, after_new),
-                Err(TryRecvError::Empty) => self.pending_state = Some((recv, after_new)),
-                Err(TryRecvError::Disconnected) => self.show_toast("State sync failed"),
+                Ok(value) => self.load_state_done(id, chat, &value, after_new),
+                Err(TryRecvError::Empty) => chat.pending_state = Some((recv, after_new)),
+                Err(TryRecvError::Disconnected) => {
+                    eprintln!("[pi-gui] state sync failed (chat {id})")
+                }
             }
         }
 
-        if let Some(recv) = self.pending_levels.take() {
+        if let Some(recv) = chat.pending_levels.take() {
             match recv.try_recv() {
-                Ok(value) => self.load_levels_done(&value),
-                Err(TryRecvError::Empty) => self.pending_levels = Some(recv),
+                Ok(value) => self.load_levels_done(id, chat, &value),
+                Err(TryRecvError::Empty) => chat.pending_levels = Some(recv),
                 Err(TryRecvError::Disconnected) => {}
             }
         }
 
-        match std::mem::replace(&mut self.pending, Pending::None) {
+        match std::mem::replace(&mut chat.pending, Pending::None) {
             Pending::None => {}
-            Pending::NewSession(recv) => match recv.try_recv() {
-                Ok(value) => {
-                    let ok = value.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let cancelled = value
-                        .pointer("/data/cancelled")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    if !ok {
-                        self.show_toast("Failed to start a new chat");
-                    } else if cancelled {
-                        self.show_toast("New chat cancelled by an extension");
-                    } else {
-                        self.pending_state =
-                            Some((self.rpc.send(PiCommand::GetState), true));
-                    }
-                }
-                Err(TryRecvError::Empty) => self.pending = Pending::NewSession(recv),
-                Err(TryRecvError::Disconnected) => {
-                    self.show_toast("Failed to start a new chat — RPC bridge died")
-                }
-            },
             Pending::Prompt(recv) => match recv.try_recv() {
                 Ok(value) => {
                     let ok = value.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -969,20 +1118,20 @@ impl State {
                             .get("error")
                             .and_then(|e| e.as_str())
                             .unwrap_or("unknown error");
-                        self.show_toast(&format!("Prompt failed: {err}"));
-                        self.busy = false;
-                        self.stop_button.set_sensitive(false);
-                        self.window_title.set_subtitle("Idle");
-                        self.finalize_streaming(None, None);
+                        eprintln!("[pi-gui] prompt failed: {err}");
+                        chat.busy = false;
+                        chat.page.set_loading(false);
+                        self.finalize_streaming(chat, None, None);
+                        self.refresh_chat_ui();
                     }
                 }
-                Err(TryRecvError::Empty) => self.pending = Pending::Prompt(recv),
+                Err(TryRecvError::Empty) => chat.pending = Pending::Prompt(recv),
                 Err(TryRecvError::Disconnected) => {
-                    self.show_toast("Prompt failed — RPC bridge died");
-                    self.busy = false;
-                    self.stop_button.set_sensitive(false);
-                    self.window_title.set_subtitle("Idle");
-                    self.finalize_streaming(None, None);
+                    eprintln!("[pi-gui] prompt failed — RPC bridge died");
+                    chat.busy = false;
+                    chat.page.set_loading(false);
+                    self.finalize_streaming(chat, None, None);
+                    self.refresh_chat_ui();
                 }
             },
             Pending::SwitchSession(recv) => match recv.try_recv() {
@@ -993,34 +1142,32 @@ impl State {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     if ok && !cancelled {
-                        self.pending = Pending::GetMessages(self.rpc.send(PiCommand::GetMessages));
+                        chat.pending = Pending::GetMessages(chat.rpc.send(PiCommand::GetMessages));
                     } else {
-                        self.loading_row.set_visible(false);
-                        self.chat_view.list.remove(&self.loading_row);
-                        self.window_title.set_subtitle("Idle");
-                        self.show_toast("Session switch cancelled");
+                        chat.loading_row.set_visible(false);
+                        chat.chat_view.list.remove(&chat.loading_row);
+                        self.refresh_chat_ui();
                     }
                 }
-                Err(TryRecvError::Empty) => self.pending = Pending::SwitchSession(recv),
+                Err(TryRecvError::Empty) => chat.pending = Pending::SwitchSession(recv),
                 Err(TryRecvError::Disconnected) => {
-                    self.loading_row.set_visible(false);
-                    self.chat_view.list.remove(&self.loading_row);
-                    self.show_toast("Session switch failed — RPC bridge died")
+                    chat.loading_row.set_visible(false);
+                    chat.chat_view.list.remove(&chat.loading_row);
+                    eprintln!("[pi-gui] session switch failed — RPC bridge died");
                 }
             },
             Pending::GetMessages(recv) => match recv.try_recv() {
-                Ok(value) => self.load_history_done(&value),
-                Err(TryRecvError::Empty) => self.pending = Pending::GetMessages(recv),
+                Ok(value) => self.load_history_done(chat, &value),
+                Err(TryRecvError::Empty) => chat.pending = Pending::GetMessages(recv),
                 Err(TryRecvError::Disconnected) => {}
             },
         }
     }
 
-    fn load_history_done(&mut self, value: &Value) {
-        self.loading_row.set_visible(false);
-        self.chat_view.list.remove(&self.loading_row);
-        self.window_title.set_subtitle("Resumed chat");
-        if let Some(started) = self.switch_started.take() {
+    fn load_history_done(&mut self, chat: &mut ChatSession, value: &Value) {
+        chat.loading_row.set_visible(false);
+        chat.chat_view.list.remove(&chat.loading_row);
+        if let Some(started) = chat.switch_started.take() {
             let render_start = std::time::Instant::now();
             let count = value
                 .pointer("/data/messages")
@@ -1028,9 +1175,9 @@ impl State {
                 .map(|a| a.len())
                 .unwrap_or(0);
             if let Some(messages) = value.pointer("/data/messages") {
-                self.render_messages(messages);
+                self.render_messages(chat, messages);
             }
-            self.chat_view.scroll_to_bottom();
+            chat.chat_view.scroll_to_bottom();
             eprintln!(
                 "[timing] session load: {} ms to messages ({}), {} ms to render",
                 started.elapsed().as_millis(),
@@ -1038,9 +1185,10 @@ impl State {
                 render_start.elapsed().as_millis()
             );
         }
+        self.refresh_chat_ui();
     }
 
-    fn render_messages(&self, messages: &Value) {
+    fn render_messages(&self, chat: &mut ChatSession, messages: &Value) {
         let Some(arr) = messages.as_array() else { return };
         // One "Agent" header per assistant run: it appears on the first
         // assistant message after anything that is not an assistant message.
@@ -1060,14 +1208,14 @@ impl State {
                         buffer.set_text(&owned);
                         view.grab_focus();
                     });
-                    self.chat_view
+                    chat.chat_view
                         .append(&chat::user_message(&text, time, Some(on_edit)).box_);
                     prev_role = Some("user".into());
                 }
                 Some("assistant") if !text.is_empty() || !thinking.is_empty() => {
                     let thinking = if thinking.is_empty() { None } else { Some(thinking.as_str()) };
                     let with_header = prev_role.as_deref() != Some("assistant");
-                    self.chat_view.append(
+                    chat.chat_view.append(
                         &chat::assistant_message(&text, thinking, time, with_header, None).box_,
                     );
                     prev_role = Some("assistant".into());
@@ -1079,7 +1227,7 @@ impl State {
 
     // ================= model list =================
 
-    fn load_models_done(&mut self, value: &Value) {
+    fn load_models_done(&mut self, id: &str, _chat: &mut ChatSession, value: &Value) {
         let mut models = Vec::new();
         if let Some(arr) = value.pointer("/data/models").and_then(|m| m.as_array()) {
             for m in arr {
@@ -1096,25 +1244,28 @@ impl State {
             models = models_from_config_file();
         }
         if models.is_empty() {
-            self.show_toast("No models available");
+            eprintln!("[pi-gui] no models available (chat {id})");
             return;
         }
         models.sort_by(|a, b| a.label.cmp(&b.label));
-        self.all_models = models;
-        self.filtered_models = self.all_models.clone();
+        // The dropdown is shared; only fill it once (models are global).
+        if self.all_models.is_empty() {
+            self.all_models = models;
+            self.filtered_models = self.all_models.clone();
 
-        let string_list = StringList::new(&[]);
-        for m in &self.filtered_models {
-            string_list.append(&m.label);
-        }
-        self.suppress_model_signal.set(true);
-        self.model_dropdown.set_model(Some(&string_list));
-        if let Some(label) = self.current_model_label.clone() {
-            if let Some(idx) = self.filtered_models.iter().position(|m| m.label == label) {
-                self.model_dropdown.set_selected(idx as u32);
+            let string_list = StringList::new(&[]);
+            for m in &self.filtered_models {
+                string_list.append(&m.label);
             }
+            self.suppress_model_signal.set(true);
+            self.model_dropdown.set_model(Some(&string_list));
+            if let Some(label) = self.current_model_label.clone() {
+                if let Some(idx) = self.filtered_models.iter().position(|m| m.label == label) {
+                    self.model_dropdown.set_selected(idx as u32);
+                }
+            }
+            self.suppress_model_signal.set(false);
         }
-        self.suppress_model_signal.set(false);
     }
 
     fn select_current_model(&mut self) {
@@ -1127,32 +1278,40 @@ impl State {
     }
 
     fn set_model(&mut self, info: ModelInfo) {
-        let _ = self
-            .rpc
-            .send(PiCommand::SetModel { provider: info.provider, model_id: info.id });
         self.current_model_label = Some(info.label.clone());
+        if let Some(chat) = self.active_chat() {
+            let _ = chat.rpc.send(PiCommand::SetModel { provider: info.provider, model_id: info.id });
+        }
     }
 
     // ================= state sync =================
 
-    fn load_state_done(&mut self, value: &Value, after_new: bool) {
+    fn load_state_done(&mut self, id: &str, chat: &mut ChatSession, value: &Value, after_new: bool) {
         let empty = serde_json::Value::Null;
         let data = value.get("data").unwrap_or(&empty);
 
         // Model.
         if let Some(model) = data.get("model") {
-            if let (Some(provider), Some(id)) = (
+            if let (Some(provider), Some(model_id)) = (
                 model.get("provider").and_then(|p| p.as_str()),
                 model.get("id").and_then(|i| i.as_str()),
             ) {
-                self.current_model_label = Some(ModelInfo::new(provider, id).label);
-                self.select_current_model();
+                let label = ModelInfo::new(provider, model_id).label;
+                // The dropdown reflects whichever chat is selected; the first
+                // state load wins (models are global anyway).
+                if self.current_model_label.is_none() || self.active.as_deref() == Some(id) {
+                    self.current_model_label = Some(label);
+                    self.select_current_model();
+                }
             }
         }
 
         // Thinking level.
         if let Some(level) = data.get("thinkingLevel").and_then(|l| l.as_str()) {
-            self.select_thinking_level(level);
+            chat.current_thinking_level = Some(level.to_string());
+            if self.active.as_deref() == Some(id) {
+                self.select_thinking_level(chat, level);
+            }
         }
 
         // Session.
@@ -1165,7 +1324,6 @@ impl State {
                 .unwrap_or_else(|| {
                     if after_new { "New chat".to_string() } else { "Current session".to_string() }
                 });
-            self.current_session_file = Some(file.clone());
             let time_label = time_label_now();
             if !self.sessions.iter().any(|(f, _, _)| *f == file) {
                 self.sessions.push((file.clone(), name.clone(), time_label.clone()));
@@ -1173,36 +1331,30 @@ impl State {
                 entry.1 = name.clone();
             }
             self.session_list.add_session(&file, &name, &time_label, true);
+            chat.current_session_file = Some(file.clone());
+            // Keep the default tab title for fresh chats; resumed ones get
+            // their real name when switched to.
+            if !chat.session_named {
+                chat.page.set_title(&name);
+            }
             self.session_list.set_active(&file);
-            self.window_title.set_title(&name);
-            self.window_title.set_subtitle("GNOME AI coding assistant");
         }
 
-        // Auto-compaction.
-        if let Some(enabled) = data.get("autoCompactionEnabled").and_then(|v| v.as_bool()) {
-            self.suppress_autocompact.set(true);
-            self.autoswitch_row.set_active(enabled);
-            self.suppress_autocompact.set(false);
+        // Auto-compaction (the row reflects the active chat's child).
+        if self.active.as_deref() == Some(id) {
+            if let Some(enabled) = data.get("autoCompactionEnabled").and_then(|v| v.as_bool()) {
+                chat.suppress_autocompact.set(true);
+                self.autoswitch_row.set_active(enabled);
+                chat.suppress_autocompact.set(false);
+            }
         }
 
         // Thinking levels for the current model.
-        self.pending_levels = Some(self.rpc.send(PiCommand::GetAvailableThinkingLevels));
-
-        // Test/deep-link hook: open a specific session once at startup. A
-        // forced session (new windows) takes precedence over the env var.
-        if !self.auto_opened.get() {
-            self.auto_opened.set(true);
-            let from_env = std::env::var("PI_GUI_OPEN_SESSION").ok();
-            if let Some(target) = self.forced_open.take().or(from_env) {
-                let known = self.sessions.iter().any(|(f, _, _)| *f == target);
-                if known && self.current_session_file.as_deref() != Some(target.as_str()) {
-                    self.on_switch_session(&target);
-                }
-            }
-        }
+        chat.pending_levels = Some(chat.rpc.send(PiCommand::GetAvailableThinkingLevels));
+        self.refresh_chat_ui();
     }
 
-    fn load_levels_done(&mut self, value: &Value) {
+    fn load_levels_done(&mut self, id: &str, chat: &mut ChatSession, value: &Value) {
         let levels: Vec<String> = value
             .pointer("/data/levels")
             .and_then(|l| l.as_array())
@@ -1216,24 +1368,28 @@ impl State {
             return;
         }
 
+        chat.thinking_levels = levels;
+        // The combo row is shared; refresh it only for the selected chat.
+        if self.active.as_deref() != Some(id) {
+            return;
+        }
         let string_list = StringList::new(&[]);
-        for level in &levels {
+        for level in &chat.thinking_levels {
             string_list.append(level);
         }
         self.suppress_thinking_signal.set(true);
         self.thinking_combo_row.set_model(Some(&string_list));
-        self.thinking_levels = levels;
-        if let Some(current) = self.current_thinking_level.clone() {
-            if let Some(idx) = self.thinking_levels.iter().position(|l| *l == current) {
+        if let Some(current) = chat.current_thinking_level.clone() {
+            if let Some(idx) = chat.thinking_levels.iter().position(|l| *l == current) {
                 self.thinking_combo_row.set_selected(idx as u32);
             }
         }
         self.suppress_thinking_signal.set(false);
     }
 
-    fn select_thinking_level(&mut self, level: &str) {
-        self.current_thinking_level = Some(level.to_string());
-        if let Some(idx) = self.thinking_levels.iter().position(|l| l == level) {
+    fn select_thinking_level(&mut self, chat: &mut ChatSession, level: &str) {
+        chat.current_thinking_level = Some(level.to_string());
+        if let Some(idx) = chat.thinking_levels.iter().position(|l| l == level) {
             self.suppress_thinking_signal.set(true);
             self.thinking_combo_row.set_selected(idx as u32);
             self.suppress_thinking_signal.set(false);
@@ -1241,8 +1397,10 @@ impl State {
     }
 
     fn set_thinking_level(&mut self, level: String) {
-        self.current_thinking_level = Some(level.clone());
-        let _ = self.rpc.send(PiCommand::SetThinkingLevel { level });
+        if let Some(chat) = self.active_chat() {
+            chat.current_thinking_level = Some(level.clone());
+            let _ = chat.rpc.send(PiCommand::SetThinkingLevel { level });
+        }
     }
 
     // ================= session discovery =================
@@ -1258,55 +1416,57 @@ impl State {
 
     // ================= agent events =================
 
-    fn handle_event(&mut self, event: &PiEvent) {
+    fn handle_event(&mut self, id: &str, chat: &mut ChatSession, event: &PiEvent) {
+        // Only the selected chat's state is mirrored into the shared widgets.
+        let is_active = self.active.as_deref() == Some(id);
         match event {
             PiEvent::AgentStart => {
-                self.busy = true;
-                self.window_title.set_subtitle("Working…");
-                self.busy_spinner.start();
-                self.busy_spinner.set_visible(true);
-                if let Some(file) = self.current_session_file.clone() {
+                chat.busy = true;
+                chat.page.set_loading(true);
+                if let Some(file) = chat.current_session_file.clone() {
                     self.session_list.set_busy(&file, true);
                 }
-                self.stop_button.set_sensitive(true);
+                if is_active {
+                    self.stop_button.set_sensitive(true);
+                }
+                self.refresh_chat_ui();
             }
             PiEvent::AgentSettled { aborted: _ } => {
-                self.busy = false;
-                self.window_title.set_subtitle("Idle");
-                self.busy_spinner.stop();
-                self.busy_spinner.set_visible(false);
-                if let Some(file) = self.current_session_file.clone() {
+                chat.busy = false;
+                chat.page.set_loading(false);
+                if let Some(file) = chat.current_session_file.clone() {
                     self.session_list.set_busy(&file, false);
                 }
-                self.stop_button.set_sensitive(false);
-                self.finalize_streaming(None, None);
-                self.chat_view.scroll_to_bottom();
+                self.finalize_streaming(chat, None, None);
+                chat.chat_view.scroll_to_bottom();
+                self.refresh_chat_ui();
             }
             PiEvent::AgentEnd | PiEvent::TurnStart | PiEvent::TurnEnd | PiEvent::Other => {}
             PiEvent::Disconnected => {
-                self.busy = false;
-                self.busy_spinner.stop();
-                self.busy_spinner.set_visible(false);
-                if let Some(file) = self.current_session_file.clone() {
+                chat.busy = false;
+                chat.page.set_loading(false);
+                chat.page.set_title(&format!("{} — disconnected", chat.page.title()));
+                if let Some(file) = chat.current_session_file.clone() {
                     self.session_list.set_busy(&file, false);
                 }
-                self.stop_button.set_sensitive(false);
-                self.send_button.set_sensitive(false);
-                self.input_view.set_sensitive(false);
-                self.window_title.set_subtitle("pi disconnected — restart the app");
-                self.show_toast("pi exited — RPC disconnected, please restart pi-gui");
+                if is_active {
+                    self.stop_button.set_sensitive(false);
+                    self.window_title.set_subtitle("pi disconnected — restart pi-gui");
+                }
+                eprintln!("[pi-gui] chat {id}: pi exited — RPC disconnected");
+                self.refresh_chat_ui();
             }
             PiEvent::Response { .. } => {}
             PiEvent::MessageStart { message } => {
                 if message.as_ref().and_then(message_role) == Some("assistant") {
-                    let with_header = !self.turn_header_shown;
-                    self.ensure_streaming(with_header);
+                    let with_header = !chat.turn_header_shown;
+                    self.ensure_streaming(chat, with_header);
                     if with_header {
-                        self.turn_header_shown = true;
+                        chat.turn_header_shown = true;
                     }
                 }
             }
-            PiEvent::MessageUpdate { event } => self.handle_message_update(event.as_ref()),
+            PiEvent::MessageUpdate { event } => self.handle_message_update(chat, event.as_ref()),
             PiEvent::MessageEnd { message } => {
                 if let Some(message) = message {
                     if message_role(message) == Some("assistant") {
@@ -1314,7 +1474,7 @@ impl State {
                         let text = content_text(&content);
                         let thinking = content_thinking(&content);
                         let thinking = if thinking.is_empty() { None } else { Some(thinking) };
-                        self.finalize_streaming(Some(&text), thinking.as_deref());
+                        self.finalize_streaming(chat, Some(&text), thinking.as_deref());
                     }
                 }
             }
@@ -1322,10 +1482,10 @@ impl State {
                 let name = tool_name.clone().unwrap_or_else(|| "tool".into());
                 let summary = tool_summary(args.as_ref());
                 let block = ToolBlock::new(&name, &summary);
-                embed_tool_content(&block, &name, args.as_ref(), self);
-                self.chat_view.append(&block.box_);
-                if let Some(id) = tool_call_id {
-                    self.tool_blocks.insert(id.clone(), block);
+                embed_tool_content(&block, &name, args.as_ref(), chat);
+                chat.chat_view.append(&block.box_);
+                if let Some(call_id) = tool_call_id {
+                    chat.tool_blocks.insert(call_id.clone(), block);
                     if let Some(path) =
                         args.as_ref().and_then(|a| a.get("path")).and_then(|p| p.as_str())
                     {
@@ -1343,15 +1503,15 @@ impl State {
                         } else {
                             ("other", None)
                         };
-                        self.tool_meta.insert(id.clone(), (path.to_string(), kind, content));
+                        chat.tool_meta.insert(call_id.clone(), (path.to_string(), kind, content));
                     }
                 }
-                self.chat_view.scroll_to_bottom();
+                chat.chat_view.scroll_to_bottom();
             }
             PiEvent::ToolExecutionUpdate { tool_call_id, partial_result } => {
                 let text = partial_result.as_ref().map(result_text).unwrap_or_default();
-                if let (Some(id), false) = (tool_call_id, text.is_empty()) {
-                    if let Some(block) = self.tool_blocks.get(id) {
+                if let (Some(call_id), false) = (tool_call_id, text.is_empty()) {
+                    if let Some(block) = chat.tool_blocks.get(call_id) {
                         if block.is_embedded() {
                             block.append_result(&text);
                         } else {
@@ -1362,8 +1522,8 @@ impl State {
             }
             PiEvent::ToolExecutionEnd { tool_call_id, result, is_error } => {
                 let text = result.as_ref().map(result_text).unwrap_or_default();
-                if let Some(id) = tool_call_id {
-                    if let Some(block) = self.tool_blocks.get(id) {
+                if let Some(call_id) = tool_call_id {
+                    if let Some(block) = chat.tool_blocks.get(call_id) {
                         if !text.is_empty() {
                             if block.is_embedded() {
                                 block.append_result(&text);
@@ -1377,13 +1537,13 @@ impl State {
                     // a successful write sets it — remember both so later
                     // write/edit cards can diff against it.
                     if *is_error != Some(true) {
-                        if let Some((path, kind, content)) = self.tool_meta.get(id) {
+                        if let Some((path, kind, content)) = chat.tool_meta.get(call_id) {
                             match (*kind, content) {
                                 ("read", _) if !text.is_empty() => {
-                                    self.file_cache.insert(path.clone(), text.clone());
+                                    chat.file_cache.insert(path.clone(), text.clone());
                                 }
                                 ("write", Some(new)) => {
-                                    self.file_cache.insert(path.clone(), new.clone());
+                                    chat.file_cache.insert(path.clone(), new.clone());
                                 }
                                 _ => {}
                             }
@@ -1395,96 +1555,105 @@ impl State {
             PiEvent::AutoRetryStart { attempt, error_message } => {
                 if let Some(attempt) = attempt {
                     // The streaming bubble carries a persistent status line;
-                    // a toast here would just add noise on every attempt.
+                    // toasts here would just add noise on every attempt.
                     let reason = error_message
                         .as_deref()
                         .map(|s| shorten_for_display(s, 80))
                         .unwrap_or_default();
-                    self.ensure_streaming(true);
-                    if let Some(streaming) = self.streaming.as_ref() {
+                    self.ensure_streaming(chat, true);
+                    if let Some(streaming) = chat.streaming.as_ref() {
                         streaming.show_retry(*attempt, &reason);
                     }
-                    self.chat_view.scroll_to_bottom();
+                    chat.chat_view.scroll_to_bottom();
                 }
             }
             PiEvent::AutoRetryEnd { success: Some(true), .. } => {
-                if let Some(streaming) = self.streaming.as_ref() {
+                if let Some(streaming) = chat.streaming.as_ref() {
                     streaming.retry_done();
                 }
             }
             PiEvent::AutoRetryEnd { success: Some(false), final_error, .. } => {
                 let err = final_error.clone().unwrap_or_default();
                 // Flush any partial streamed content, then leave a permanent
-                // error row in the transcript (toasts disappear on their own).
-                self.finalize_streaming(None, None);
+                // error row in the transcript.
+                self.finalize_streaming(chat, None, None);
                 let err = if err.is_empty() {
                     "The provider failed after repeated retries.".to_string()
                 } else {
                     format!("Provider error after retries: {}", shorten_for_display(&err, 200))
                 };
                 let bubble = chat::error_message(&err);
-                self.chat_view.append(&bubble.box_);
-                self.chat_view.scroll_to_bottom();
+                chat.chat_view.append(&bubble.box_);
+                chat.chat_view.scroll_to_bottom();
             }
             PiEvent::AutoRetryEnd { .. } => {}
             PiEvent::SessionInfoChanged { name } => {
-                if let (Some(name), Some(file)) = (name, self.current_session_file.clone()) {
-                    self.session_list.rename_session(&file, name);
-                    self.window_title.set_title(name);
-                    if let Some(entry) = self.sessions.iter_mut().find(|(f, _, _)| *f == file) {
-                        entry.1 = name.clone();
+                if let Some(name) = name {
+                    chat.page.set_title(name);
+                    if let Some(file) = chat.current_session_file.clone() {
+                        self.session_list.rename_session(&file, name);
+                        if let Some(entry) =
+                            self.sessions.iter_mut().find(|(f, _, _)| *f == file)
+                        {
+                            entry.1 = name.clone();
+                        }
+                    }
+                    if is_active {
+                        self.window_title.set_title(name);
                     }
                 }
             }
             PiEvent::ThinkingLevelChanged { level } => {
                 if let Some(level) = level {
-                    self.select_thinking_level(level);
+                    chat.current_thinking_level = Some(level.to_string());
+                    if is_active {
+                        self.select_thinking_level(chat, level);
+                    }
                 }
             }
             PiEvent::ExtensionUiRequest { id, method, extra } => {
-                self.handle_extension_request(id, method, extra);
+                self.handle_extension_request(id, method, extra, chat);
             }
             PiEvent::ExtensionError { extension_path, error, .. } => {
                 eprintln!("[extension error] {extension_path}: {error}");
-                self.show_toast(&format!("Extension error: {error}"));
             }
         }
     }
 
-    fn handle_message_update(&mut self, event: Option<&Value>) {
+    fn handle_message_update(&mut self, chat: &mut ChatSession, event: Option<&Value>) {
         let Some(event) = event else { return };
         match event.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "text_start" => {
-                self.ensure_streaming(!self.turn_header_shown);
+                self.ensure_streaming(chat, !chat.turn_header_shown);
             }
             "text_delta" => {
                 if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
-                    self.ensure_streaming(!self.turn_header_shown);
-                    if let Some(streaming) = self.streaming.as_ref() {
+                    self.ensure_streaming(chat, !chat.turn_header_shown);
+                    if let Some(streaming) = chat.streaming.as_ref() {
                         streaming.append_text(delta);
                     }
-                    self.chat_view.scroll_to_bottom();
+                    chat.chat_view.scroll_to_bottom();
                 }
             }
             "thinking_delta" => {
                 if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
-                    self.ensure_streaming(!self.turn_header_shown);
-                    if let Some(streaming) = self.streaming.as_ref() {
+                    self.ensure_streaming(chat, !chat.turn_header_shown);
+                    if let Some(streaming) = chat.streaming.as_ref() {
                         streaming.append_thinking(delta);
                     }
-                    self.chat_view.scroll_to_bottom();
+                    chat.chat_view.scroll_to_bottom();
                 }
             }
             "text_end" => {
                 if let Some(content) = event.get("content").and_then(|c| c.as_str()) {
-                    if let Some(streaming) = self.streaming.as_ref() {
+                    if let Some(streaming) = chat.streaming.as_ref() {
                         streaming.set_text(content);
                     }
                 }
             }
             "thinking_end" => {
                 if let Some(content) = event.get("content").and_then(|c| c.as_str()) {
-                    if let Some(streaming) = self.streaming.as_ref() {
+                    if let Some(streaming) = chat.streaming.as_ref() {
                         streaming.set_thinking(content);
                         streaming.finish_thinking();
                     }
@@ -1492,7 +1661,7 @@ impl State {
             }
             "error" => {
                 let msg = event.get("error").and_then(|e| e.as_str()).unwrap_or("stream error");
-                self.show_toast(&format!("Stream error: {msg}"));
+                eprintln!("[pi-gui] stream error: {msg}");
             }
             _ => {}
         }
@@ -1500,22 +1669,22 @@ impl State {
 
     /// Make sure a streaming bubble exists, drawing the turn header on its
     /// first row only; remember that the turn's header was drawn.
-    fn ensure_streaming(&mut self, with_header: bool) {
-        if self.streaming.is_none() {
+    fn ensure_streaming(&mut self, chat: &mut ChatSession, with_header: bool) {
+        if chat.streaming.is_none() {
             let streaming = StreamingBubble::new(with_header);
             if with_header {
-                self.turn_header_shown = true;
+                chat.turn_header_shown = true;
             }
-            self.chat_view.append(&streaming.container);
-            self.streaming = Some(streaming);
-            self.chat_view.scroll_to_bottom();
+            chat.chat_view.append(&streaming.container);
+            chat.streaming = Some(streaming);
+            chat.chat_view.scroll_to_bottom();
         }
     }
 
     /// Replace the streaming bubble with a final assistant bubble. With
     /// `text: None` any dangling streaming bubble is just removed.
-    fn finalize_streaming(&mut self, text: Option<&str>, thinking: Option<&str>) {
-        if let Some(streaming) = self.streaming.take() {
+    fn finalize_streaming(&mut self, chat: &mut ChatSession, text: Option<&str>, thinking: Option<&str>) {
+        if let Some(streaming) = chat.streaming.take() {
             let text = text.unwrap_or("");
             let thinking = thinking.unwrap_or("");
             let has_content = !text.is_empty() || !thinking.is_empty();
@@ -1529,45 +1698,48 @@ impl State {
                 );
                 // Insert at the streaming bubble's position so tool blocks
                 // that already followed it stay in order.
-                self.chat_view.list.insert_child_after(&bubble.box_, Some(&streaming.container));
+                chat.chat_view.list.insert_child_after(&bubble.box_, Some(&streaming.container));
             }
-            self.chat_view.list.remove(&streaming.container);
+            chat.chat_view.list.remove(&streaming.container);
+            // The swap changes heights after the last append scrolled; land on
+            // the final bubble, not wherever the removed bubble left the view.
+            chat.chat_view.scroll_to_bottom();
         }
     }
 
     // ================= extension UI requests =================
 
-    fn handle_extension_request(&self, id: &str, method: &str, extra: &Value) {
+    fn handle_extension_request(&self, id: &str, method: &str, extra: &Value, chat: &ChatSession) {
         match method {
             "confirm" => {
                 let title = extra.get("title").and_then(|t| t.as_str()).unwrap_or("Confirm");
                 let message = extra.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                self.show_confirm(id, title, message);
+                self.show_confirm(id, title, message, chat);
             }
             "input" => {
                 let title = extra.get("title").and_then(|t| t.as_str()).unwrap_or("Input");
                 let placeholder = extra.get("placeholder").and_then(|p| p.as_str()).unwrap_or("");
-                self.show_input(id, title, placeholder);
+                self.show_input(id, title, placeholder, chat);
             }
             "editor" => {
                 let title = extra.get("title").and_then(|t| t.as_str()).unwrap_or("Edit text");
                 let prefill = extra.get("prefill").and_then(|p| p.as_str()).unwrap_or("");
-                self.show_editor(id, title, prefill);
+                self.show_editor(id, title, prefill, chat);
             }
             "select" => {
                 let title = extra.get("title").and_then(|t| t.as_str()).unwrap_or("Select");
-                self.show_select(id, title, extra);
+                self.show_select(id, title, extra, chat);
             }
-            // Fire-and-forget methods: display, never respond.
+            // Fire-and-forget methods: log, never respond.
             "notify" => {
                 let message = extra.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                self.show_toast(message);
+                eprintln!("[extension notify] {message}");
             }
             "setStatus" | "setWidget" | "setTitle" | "set_editor_text" | _ => {}
         }
     }
 
-    fn show_confirm(&self, id: &str, title: &str, message: &str) {
+    fn show_confirm(&self, id: &str, title: &str, message: &str, chat: &ChatSession) {
         let dialog = MessageDialog::builder()
             .heading(title)
             .body(message)
@@ -1579,7 +1751,7 @@ impl State {
         dialog.set_close_response("cancel");
 
         let id = id.to_string();
-        let rpc = self.rpc.clone();
+        let rpc = chat.rpc.clone();
         dialog.connect_local("response", false, move |values| {
             let response = values
                 .first()
@@ -1592,7 +1764,7 @@ impl State {
         dialog.present();
     }
 
-    fn show_input(&self, id: &str, title: &str, placeholder: &str) {
+    fn show_input(&self, id: &str, title: &str, placeholder: &str, chat: &ChatSession) {
         let dialog = MessageDialog::builder()
             .heading(title)
             .transient_for(&self.window)
@@ -1609,7 +1781,7 @@ impl State {
         dialog.set_extra_child(Some(&entry));
 
         let id = id.to_string();
-        let rpc = self.rpc.clone();
+        let rpc = chat.rpc.clone();
         let entry_weak = entry.downgrade();
         dialog.connect_local("response", false, move |values| {
             let response = values
@@ -1631,7 +1803,7 @@ impl State {
         dialog.present();
     }
 
-    fn show_editor(&self, id: &str, title: &str, prefill: &str) {
+    fn show_editor(&self, id: &str, title: &str, prefill: &str, chat: &ChatSession) {
         let dialog = MessageDialog::builder()
             .heading(title)
             .transient_for(&self.window)
@@ -1661,7 +1833,7 @@ impl State {
         dialog.set_extra_child(Some(&scrolled));
 
         let id = id.to_string();
-        let rpc = self.rpc.clone();
+        let rpc = chat.rpc.clone();
         let view_weak = view.downgrade();
         dialog.connect_local("response", false, move |values| {
             let response = values
@@ -1687,7 +1859,7 @@ impl State {
         dialog.present();
     }
 
-    fn show_select(&self, id: &str, title: &str, extra: &Value) {
+    fn show_select(&self, id: &str, title: &str, extra: &Value, chat: &ChatSession) {
         let options = extra
             .get("options")
             .and_then(|o| o.as_array())
@@ -1724,7 +1896,7 @@ impl State {
         dialog.set_extra_child(Some(&list));
 
         let id = id.to_string();
-        let rpc = self.rpc.clone();
+        let rpc = chat.rpc.clone();
         let list_weak = list.downgrade();
         dialog.connect_local("response", false, move |values| {
             let response = values
@@ -1755,16 +1927,6 @@ impl State {
         dialog.present();
     }
 
-    fn show_toast(&self, message: &str) {
-        if message.is_empty() {
-            return;
-        }
-        // Toast titles are parsed as Pango markup; escape anything the model
-        // or an extension emitted (e.g. "<url>" in a warning message).
-        let title = glib::markup_escape_text(message);
-        let toast = Toast::builder().title(title).build();
-        self.chat_view.overlay.add_toast(toast);
-    }
 }
 
 // ================= session discovery helpers =================

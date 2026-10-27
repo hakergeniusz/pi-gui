@@ -10,7 +10,6 @@ use gtk4::prelude::*;
 use gtk4::{
     Align, Box, Button, Image, Label, Orientation, Revealer, ScrolledWindow, Spinner, ToggleButton,
 };
-use libadwaita::ToastOverlay;
 
 /// A single rendered chat message row.
 pub struct MessageBubble {
@@ -325,7 +324,6 @@ pub fn assistant_message(
 
     if !text.is_empty() {
         let label = Label::builder()
-            .label(text)
             .xalign(0.0)
             .yalign(0.0)
             .wrap(true)
@@ -333,7 +331,9 @@ pub fn assistant_message(
             .max_width_chars(78)
             .hexpand(true)
             .selectable(true)
+            .use_markup(true)
             .build();
+        label.set_markup(&markdown_to_pango(text));
         label.add_css_class("message-text");
         container.append(&label);
     }
@@ -389,6 +389,8 @@ pub struct StreamingBubble {
     thinking_started: std::cell::Cell<Option<std::time::Instant>>,
     /// How long the thinking phase took, once it finished.
     thought_secs: std::cell::Cell<Option<u64>>,
+    /// Raw (unrendered) answer text accumulated while streaming.
+    raw_text: std::cell::RefCell<String>,
 }
 
 impl StreamingBubble {
@@ -450,6 +452,7 @@ impl StreamingBubble {
             has_header: with_header,
             thinking_started: std::cell::Cell::new(None),
             thought_secs: std::cell::Cell::new(None),
+            raw_text: std::cell::RefCell::new(String::new()),
         }
     }
 
@@ -503,15 +506,19 @@ impl StreamingBubble {
 
     pub fn append_text(&self, text: &str) {
         self.text_started();
-        let current = self.label.text().to_string();
-        self.label.set_text(&format!("{current}{text}"));
+        // Keep the raw accumulation — the label renders Pango markup, so
+        // reading it back would give the styled text, not the source.
+        let raw = self.raw_text.borrow().clone() + text;
+        *self.raw_text.borrow_mut() = raw.clone();
+        self.label.set_markup(&markdown_to_pango(&raw));
     }
 
     pub fn set_text(&self, text: &str) {
         if !text.is_empty() {
             self.text_started();
         }
-        self.label.set_text(text);
+        *self.raw_text.borrow_mut() = text.to_string();
+        self.label.set_markup(&markdown_to_pango(text));
     }
 
     pub fn append_thinking(&self, text: &str) {
@@ -922,7 +929,11 @@ impl ToolBlock {
             self.status_icon.set_icon_name(Some("object-select-symbolic"));
         }
         self.status_icon.set_visible(true);
-        self.set_expanded(false);
+        // Plain cards collapse to keep the transcript tidy; cards carrying
+        // embedded file contents/diffs stay open — that content is the point.
+        if !self.embedded.get() {
+            self.set_expanded(false);
+        }
     }
 
     fn set_expanded(&self, expanded: bool) {
@@ -945,7 +956,6 @@ impl ToolBlock {
 pub struct ChatView {
     pub scrolled: ScrolledWindow,
     pub list: Box,
-    pub overlay: ToastOverlay,
 }
 
 impl ChatView {
@@ -967,10 +977,26 @@ impl ChatView {
             .build();
         scrolled.add_css_class("chat-scroll");
 
-        let overlay = ToastOverlay::new();
-        overlay.add_css_class("chat-scroll");
+        // Rows keep growing after append (labels wrap, diff cards get real
+        // heights on later layout passes), and each growth fires `changed` on
+        // the adjustment. Re-pin to the new bottom whenever the view was at
+        // the bottom before the change — but never yank a reader who
+        // deliberately scrolled up.
+        let at_bottom = std::rc::Rc::new(std::cell::Cell::new(true));
+        let adjustment = scrolled.vadjustment();
+        let flag = at_bottom.clone();
+        adjustment.connect_value_changed(move |adj| {
+            flag.set(adj.value() + adj.page_size() >= adj.upper() - 40.0);
+        });
+        let adjustment = scrolled.vadjustment();
+        let flag = at_bottom.clone();
+        adjustment.connect_changed(move |adj| {
+            if flag.get() {
+                adj.set_value(adj.upper() - adj.page_size());
+            }
+        });
 
-        Self { scrolled, list, overlay }
+        Self { scrolled, list }
     }
 
     pub fn append(&self, widget: &impl IsA<gtk4::Widget>) {
@@ -981,6 +1007,14 @@ impl ChatView {
     pub fn scroll_to_bottom(&self) {
         let adjustment = self.scrolled.vadjustment();
         adjustment.set_value(adjustment.upper() - adjustment.page_size());
+        // Rows appended in this tick only get their real height on the next
+        // layout pass (resize priority runs before idle); scroll again then,
+        // or the view stops short of the newest message.
+        let adjustment = self.scrolled.vadjustment();
+        glib::idle_add_local(move || {
+            adjustment.set_value(adjustment.upper() - adjustment.page_size());
+            glib::ControlFlow::Break
+        });
     }
 
     pub fn clear(&self) {
@@ -1021,5 +1055,136 @@ mod tests {
         let file = "line one\nline two\nfn run() {\n    body();\n}\n";
         assert_eq!(find_block_line(file, "fn run() {\n    body();\n}"), Some(3));
         assert_eq!(find_block_line(file, "not present"), None);
+    }
+}
+
+// ================= markdown =================
+
+/// Render a small markdown subset as Pango markup: fenced ``` code blocks and
+/// `inline code` become monospace, **bold**, *italic*, `#` headings and
+/// `-`/`*` bullets are styled. Everything is escaped first, so the output is
+/// always valid markup. Used for assistant messages.
+pub fn markdown_to_pango(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 64);
+    let mut in_code = false;
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("```") {
+            in_code = !in_code;
+            if !in_code && rest.is_empty() {
+                continue; // closing fence — no extra blank line
+            }
+            if in_code && !rest.is_empty() {
+                // opening fence with a language tag: hide it
+                continue;
+            }
+            continue;
+        }
+        let escaped = escape_pango(line);
+        if in_code {
+            out.push_str(&format!("<tt>{escaped}</tt>\n"));
+            continue;
+        }
+        // Headings: # .. ###  → bold + size.
+        let heading = trimmed.chars().take_while(|c| *c == '#').count();
+        if (1..=4).contains(&heading)
+            && trimmed[heading..].starts_with(' ')
+            && heading <= trimmed.len() - 1
+        {
+            let text = escape_pango(trimmed[heading..].trim());
+            let size = match heading {
+                1 => "170%",
+                2 => "140%",
+                _ => "120%",
+            };
+            out.push_str(&format!("<b><span size=\"{size}\">{text}</span></b>\n"));
+            continue;
+        }
+        // Bullets.
+        let body = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* "));
+        let (prefix, content) = match body {
+            Some(text) => ("•  ", escape_pango(text)),
+            None => ("", escaped),
+        };
+        out.push_str(&format!("{prefix}{}\n", inline_md(&content)));
+    }
+    out.trim_end().to_string()
+}
+
+/// Inline styles on already-escaped text: `code`, **bold**, *italic*.
+/// Unmatched markers stay literal; a single `*` never opens emphasis on
+/// content that starts with a space ("a * b" stays literal).
+fn inline_md(escaped: &str) -> String {
+    let mut out = String::with_capacity(escaped.len());
+    let mut rest = escaped;
+    while let Some(pos) = rest.find(['`', '*']) {
+        out.push_str(&rest[..pos]);
+        rest = &rest[pos..];
+        if let Some(after) = rest.strip_prefix('`') {
+            if let Some(end) = after.find('`') {
+                out.push_str(&format!("<tt>{}</tt>", &after[..end]));
+                rest = &after[end + 1..];
+            } else {
+                out.push('`');
+                rest = after;
+            }
+        } else if let Some(after) = rest.strip_prefix("**") {
+            // Bold before italic, so ** never reads as two italics.
+            if let Some(end) = after.find("**") {
+                out.push_str(&format!("<b>{}</b>", inline_md(&after[..end])));
+                rest = &after[end + 2..];
+            } else {
+                out.push_str("**");
+                rest = after;
+            }
+        } else {
+            // Single '*': italic only with a closing '*' after real content.
+            let after = &rest[1..];
+            if let Some(end) = after.find('*') {
+                let italic = &after[..end];
+                if !italic.is_empty() && !italic.starts_with(' ') {
+                    out.push_str(&format!("<i>{}</i>", inline_md(italic)));
+                    rest = &after[end + 1..];
+                    continue;
+                }
+            }
+            out.push('*');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Escape &, < and > for Pango markup.
+fn escape_pango(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod md_tests {
+    use super::*;
+
+    #[test]
+    fn markdown_renders_bold_code_and_lists() {
+        let md = "**Root:**\n- `Cargo.toml`\n* plain\n# Heading\n```\nlet x = 1;\n```\nplain & <safe>";
+        let pango = markdown_to_pango(md);
+        assert!(pango.contains("<b>Root:</b>"));
+        assert!(pango.contains("•  <tt>Cargo.toml</tt>"));
+        assert!(pango.contains("•  plain"));
+        assert!(pango.contains("<b><span size=\"170%\">Heading</span></b>"));
+        assert!(pango.contains("<tt>let x = 1;</tt>"));
+        assert!(pango.contains("plain &amp; &lt;safe&gt;"));
+        assert!(!pango.contains("```"));
+    }
+
+    #[test]
+    fn markdown_keeps_unmatched_markers_literal() {
+        let pango = markdown_to_pango("a * b ` c");
+        assert!(pango.contains("a * b ` c"));
+        // Adjacent asterisks (e.g. exponentiation) must stay literal, not
+        // loop or pair.
+        let pango = markdown_to_pango("2 ** 3 = 8");
+        assert!(pango.contains("2 ** 3 = 8"));
     }
 }

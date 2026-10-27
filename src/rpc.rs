@@ -30,10 +30,6 @@ pub enum PiCommand {
     Prompt { message: String },
     Steer { message: String },
     Abort,
-    NewSession {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        parent_session: Option<String>,
-    },
     GetState,
     GetMessages,
     GetAvailableModels,
@@ -424,9 +420,6 @@ mod tests {
             json,
             serde_json::json!({"type": "set_model", "provider": "nvidia", "modelId": "nemotron"})
         );
-
-        let json = serde_json::to_value(PiCommand::NewSession { parent_session: None }).unwrap();
-        assert_eq!(json, serde_json::json!({"type": "new_session"}));
 
         let json = serde_json::to_value(PiCommand::SwitchSession {
             session_path: "/tmp/s.jsonl".into(),

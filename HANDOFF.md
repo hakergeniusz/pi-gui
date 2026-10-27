@@ -1,8 +1,8 @@
 # pi-gui — HANDOFF
 
-State as of 2026-10-26 (evening). Two rounds committed: the layout/retry fixes and
-the feedback batch (spinners, gear, toast pruning, multi-window, edit, loading
-states). Read this before touching the code.
+State as of 2026-10-27 (evening). Three rounds committed: the layout/retry fixes, the
+feedback batch (spinners, gear, toast pruning, edit, loading states), and the
+markdown + per-session tabs round. Read this before touching the code.
 
 ## What this is
 
@@ -16,7 +16,36 @@ reasoning, tool cards), no web stack.
   handling), `src/rpc.rs` (child process + JSONL protocol), `src/chat.rs` (transcript
   widgets), `src/session_list.rs` (sidebar), `src/style.rs` (all CSS)
 
-## Feature batch #2 (2026-10-26 evening) — all implemented
+## Feature batch #3 (2026-10-27) — markdown, zero toasts, tabs — all verified
+
+1. **Markdown rendering** — `chat.rs::markdown_to_pango`: ``` fences → `<tt>` blocks
+   (language tag hidden), `#`..`####` headings → sized bold, `- `/`* ` bullets → `•  `,
+   inline `` `code` `` / `**bold**` / `*italic*`. `inline_md` checks `**` BEFORE `*`
+   (so `**Root:**` is bold and `a * b` stays literal); unmatched markers stay literal.
+   Applied to history bubbles AND streamed finals. 2 unit tests cover it.
+2. **Zero toasts** — `show_toast` deleted entirely; extension `notify` → stderr log;
+   ExtensionError → stderr; stream error → stderr. Persistent in-transcript rows
+   (retry status, error row) cover everything a toast used to say.
+3. **Per-session tabs in one window** — `ChatSession` owns its pi RPC child, ChatView,
+   streaming/tool state and TabPage; `State` holds the TabView + shared widgets.
+   `create_chat_tab(Some(path))` opens a session in a new tab; closing a tab kills
+   that chat's pi child. `PI_GUI_OPEN_SESSION` accepts a `;`-separated list → one tab
+   per path (tests use this). Tabs run concurrently (verified: 2 tabs, 2 fake-pi
+   children, independent sessions). Autoswitch toggle is per-chat via
+   `ChatSession.suppress_autocompact` so programmatic row updates don't loop back.
+4. **Pin-to-bottom scroll** — `ChatView` connects `changed` on the vadjustment: when
+   the content height changes and the view was at the bottom (±40px), it re-pins.
+   This catches late allocations (a freshly inserted bubble's height lands a frame or
+   two after insert) without yanking a reader who scrolled up. `scroll_to_bottom`
+   also does one idle re-scroll for the same-tick case. Root cause found via a
+   temporary widget dump: the final bubble WAS in the list with h=0 at swap time,
+   height landing ~2s later — the app was right, the verification viewport was lying
+   (see pitfalls).
+5. **Cards keep embedded content open** — `ToolBlock::set_finished` no longer collapses
+   cards carrying embedded file contents/diffs (`embedded` flag); plain cards still
+   collapse to keep the transcript tidy.
+
+## Feature batch #2 (2026-10-26 evening)
 
 1. **Working indicator** — spinner in the header title (visible while the agent
    runs) AND the running session's sidebar row swaps its file icon for a spinner.
@@ -25,16 +54,10 @@ reasoning, tool cards), no web stack.
    `preferences-system-symbolic` renders as a star-ish icon in current GNOME.
 3. **Toast pruning** — removed per-retry toasts (persistent status line covers it),
    provider-error toast (error row covers it), "Stopped", "New chat started",
-   "Model: …". Remaining toasts are failure paths only (RPC died, switch cancelled,
-   no models, extension errors) plus extension-initiated notifies.
-4. **Multi-session at once** — "New window" header button (window-new-symbolic) +
-   every `pi-gui` launch opens an additional window. Each window owns its pi RPC
-   child, sidebar and state (GtkApplication single-instance: new launches hand off
-   via activate → new window in the primary process). Verified: two windows, two
-   fake-pi children, independent sessions.
-   NOTE: env hooks (PI_GUI_OPEN_SESSION) of the SECOND process do not reach the
-   primary's new window (env is read by the primary) — per-window options need a
-   different IPC if ever needed.
+   "Model: …". SUPERSEDED by batch #3: ALL toasts are gone now.
+4. **Multi-session at once** — SUPERSEDED by per-session tabs (batch #3 item 3);
+   the "New window" header button still exists (GtkApplication single-instance:
+   new launches hand off to the primary via activate).
 5. **Edit messages** — hovering a user bubble reveals a pencil button left of it
    (EventControllerMotion); clicking prefills the input with the message text and
    focuses it. Re-sending appends a NEW message (pi's RPC has no history-truncation
@@ -66,8 +89,8 @@ reasoning, tool cards), no web stack.
    `retry_done()` on success, and `chat::error_message()` red row on final failure
    (survives AgentSettled). ✅ Both states verified on broadway.
 
-All 3 `cargo test --release` tests green (wire-format round trips + the
-write-starvation regression test).
+All 8 `cargo test --release` tests green (3 rpc wire/bridge, 3 diff engine,
+2 markdown).
 
 ## Testing recipes
 
@@ -82,8 +105,14 @@ write-starvation regression test).
   each containing one line `{"type":"session_info","name":"<display name>"}` so the
   sidebar picks a label. gio trash them when done (they pollute the real sidebar).
 - Run: `PI_GUI_PI_BIN=/tmp/ai-agent/fake-pi.py PI_GUI_DIRECT=1 GDK_BACKEND=broadway
-  BROADWAY_DISPLAY=:2 PI_GUI_OPEN_SESSION=<session path> target/release/pi-gui`
+  BROADWAY_DISPLAY=:2 PI_GUI_OPEN_SESSION=<path>[;<path>…] target/release/pi-gui`
+  (a `;`-separated list opens one tab per session — unknown paths are filtered out).
 - Verify: browser on http://127.0.0.1:8091 — **screenshots only, never click**.
+- **The GTK window is taller than the default 720px IAB viewport** — the bottom of
+  the transcript (last bubble, input box) falls below the browser fold and looks
+  missing. Call `tab.setViewportSize({width: 1280, height: 1000})` on the TAB (not
+  `tab.playwright.*`) BEFORE `goto`, and don't resize an already-rendered broadway
+  page — the resize wedges frame delivery (screenshot times out; restart required).
 
 ### fake-pi.py spec (recreate if lost)
 
@@ -122,8 +151,11 @@ row and clicking it short-circuits), `get_available_models`,
   daemon arg `:N` creates socket `broadway{N+1}.socket`; client needs
   `BROADWAY_DISPLAY=:N` matching the daemon arg.
 - GTK4: Button with both `label` and `icon_name` shows only the icon — compose a child
-  Box (`icon_label_box()` in app.rs). AdwToast titles parse Pango markup — escape with
-  `glib::markup_escape_text` (`show_toast` already does).
+  Box (`icon_label_box()` in app.rs).
+- **GTK heights land late**: a widget appended this tick reports h=0 until a later
+  layout pass; anything that reads `upper()` right after an append sees stale values.
+  That's what `ChatView`'s `changed`-signal pin + idle re-scroll handle — don't remove
+  either thinking a scroll "already happened".
 - Processes appear as `ZCode-3.16.3-linux-x64.AppImage` in some process listings; the
   Bash sandbox also re-executes commands on streaming-recovery retries — don't trust
   one pid printout, re-check with ps.
@@ -144,5 +176,6 @@ row and clicking it short-circuits), `get_available_models`,
 2. Env integration: GUI should pick up the user's `.zsh_secrets` environment (original
    requirement; `PI_GUI_PI_BIN` / `PI_GUI_DIRECT` / `PI_GUI_OPEN_SESSION` env hooks
    exist — verify what else is needed for secrets passthrough to the pi child).
-3. Possible next UI polish: markdown rendering in assistant text (currently plain
-   labels — `**2 + 2 = 4**` shows literal asterisks), streamdown-style code blocks.
+3. Split view for several chats at once (user asked; deferred — tabs landed first).
+4. Possible next UI polish: streamdown-style code blocks (syntax highlighting, copy
+   button) on top of the markdown renderer.
