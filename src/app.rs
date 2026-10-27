@@ -87,6 +87,12 @@ struct State {
     tool_blocks: HashMap<String, ToolBlock>,
     /// The current assistant turn already drew its "Agent" header.
     turn_header_shown: bool,
+    /// Last known content per file path (from read results), so write/edit
+    /// cards can diff against the previous state.
+    file_cache: HashMap<String, String>,
+    /// toolCallId → (path, kind, content) for read/write calls feeding the
+    /// file cache (write carries the new content, applied on success).
+    tool_meta: HashMap<String, (String, &'static str, Option<String>)>,
 
     pending: Pending,
     pending_models: Option<Receiver<Value>>,
@@ -423,6 +429,8 @@ impl PiWindow {
             streaming: None,
             tool_blocks: HashMap::new(),
             turn_header_shown: false,
+            file_cache: HashMap::new(),
+            tool_meta: HashMap::new(),
             pending: Pending::None,
             pending_models: None,
             pending_state: None,
@@ -661,27 +669,76 @@ fn result_text(result: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// Put the file content (write) or old/new blocks (edit) into the tool card
-/// body, so runs that change files show what actually changed.
-fn embed_tool_content(block: &chat::ToolBlock, tool_name: &str, args: Option<&Value>) {
+/// Put the previous→next change into a write/edit tool card body: a git-style
+/// diff against the cached file state when one is known, else the plain
+/// content. Edit hunks get real line numbers when the file was read earlier.
+fn embed_tool_content(
+    block: &chat::ToolBlock,
+    tool_name: &str,
+    args: Option<&Value>,
+    state: &State,
+) {
     let Some(args) = args else { return };
     let name = tool_name.to_lowercase();
     if name.contains("write") {
-        if let Some(content) = args.get("content").and_then(|c| c.as_str()) {
-            block.set_embedded_text(content);
+        let Some(content) = args.get("content").and_then(|c| c.as_str()) else { return };
+        let old = args
+            .get("path")
+            .and_then(|p| p.as_str())
+            .and_then(|path| state.file_cache.get(path).cloned());
+        let rows = old.and_then(|old| chat::diff_numbered(&old, content, 1, 1));
+        match rows {
+            Some(rows) => block.set_embedded_diff(&rows),
+            None => block.set_embedded_text(content),
         }
     } else if name.contains("edit") {
-        if let Some(edits) = args.get("edits").and_then(|e| e.as_array()) {
-            let pairs: Vec<(String, String)> = edits
-                .iter()
-                .filter_map(|e| {
-                    let old = e.get("oldText").and_then(|t| t.as_str())?.to_string();
-                    let new = e.get("newText").and_then(|t| t.as_str())?.to_string();
-                    Some((old, new))
-                })
-                .collect();
-            block.set_embedded_diff(&pairs);
+        let Some(edits) = args.get("edits").and_then(|e| e.as_array()) else { return };
+        let file = args
+            .get("path")
+            .and_then(|p| p.as_str())
+            .and_then(|path| state.file_cache.get(path).cloned());
+        let mut rows: Vec<chat::DiffLine> = Vec::new();
+        for edit in edits {
+            let Some(old) = edit.get("oldText").and_then(|t| t.as_str()) else { continue };
+            let Some(new) = edit.get("newText").and_then(|t| t.as_str()) else { continue };
+            // Number from the block's real position in the file when known.
+            let start = file
+                .as_deref()
+                .and_then(|f| chat::find_block_line(f, old))
+                .unwrap_or(1);
+            let hunk = chat::diff_numbered(old, new, start, start).unwrap_or_else(|| {
+                // Fully replaced block: still show it as -old/+new.
+                let old = chat::cap_lines(old, 400);
+                let new = chat::cap_lines(new, 400);
+                let mut rows: Vec<chat::DiffLine> = old
+                    .lines()
+                    .enumerate()
+                    .map(|(i, line)| chat::DiffLine {
+                        kind: chat::DiffKind::Old,
+                        old_no: Some(start + i as u32),
+                        new_no: None,
+                        text: line.to_string(),
+                    })
+                    .collect();
+                rows.extend(new.lines().enumerate().map(|(i, line)| chat::DiffLine {
+                    kind: chat::DiffKind::New,
+                    old_no: None,
+                    new_no: Some(start + i as u32),
+                    text: line.to_string(),
+                }));
+                rows
+            });
+            if !rows.is_empty() {
+                rows.push(chat::DiffLine {
+                    kind: chat::DiffKind::Context,
+                    old_no: None,
+                    new_no: None,
+                    text: "···".into(),
+                });
+            }
+            rows.extend(hunk);
         }
+        block.set_embedded_diff(&rows);
     }
 }
 
@@ -1265,10 +1322,29 @@ impl State {
                 let name = tool_name.clone().unwrap_or_else(|| "tool".into());
                 let summary = tool_summary(args.as_ref());
                 let block = ToolBlock::new(&name, &summary);
-                embed_tool_content(&block, &name, args.as_ref());
+                embed_tool_content(&block, &name, args.as_ref(), self);
                 self.chat_view.append(&block.box_);
                 if let Some(id) = tool_call_id {
                     self.tool_blocks.insert(id.clone(), block);
+                    if let Some(path) =
+                        args.as_ref().and_then(|a| a.get("path")).and_then(|p| p.as_str())
+                    {
+                        let lower = name.to_lowercase();
+                        let (kind, content) = if lower.contains("read") {
+                            ("read", None)
+                        } else if lower.contains("write") {
+                            (
+                                "write",
+                                args.as_ref()
+                                    .and_then(|a| a.get("content"))
+                                    .and_then(|c| c.as_str())
+                                    .map(str::to_string),
+                            )
+                        } else {
+                            ("other", None)
+                        };
+                        self.tool_meta.insert(id.clone(), (path.to_string(), kind, content));
+                    }
                 }
                 self.chat_view.scroll_to_bottom();
             }
@@ -1296,6 +1372,22 @@ impl State {
                             }
                         }
                         block.set_finished(*is_error == Some(true));
+                    }
+                    // A successful read reveals the file's current content and
+                    // a successful write sets it — remember both so later
+                    // write/edit cards can diff against it.
+                    if *is_error != Some(true) {
+                        if let Some((path, kind, content)) = self.tool_meta.get(id) {
+                            match (*kind, content) {
+                                ("read", _) if !text.is_empty() => {
+                                    self.file_cache.insert(path.clone(), text.clone());
+                                }
+                                ("write", Some(new)) => {
+                                    self.file_cache.insert(path.clone(), new.clone());
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }

@@ -232,6 +232,11 @@ window {
     padding: 2px 6px;
 }
 
+.diff-ctx {
+    color: alpha(@view_fg_color, 0.45);
+    padding: 2px 6px;
+}
+
 /* ================= Input bar ================= */
 .input-card {
     background-color: @card_bg_color;

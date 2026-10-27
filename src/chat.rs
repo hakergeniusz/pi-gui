@@ -562,10 +562,137 @@ pub struct ToolBlock {
 
 /// Cap for embedded file contents so a huge write doesn't stall the UI.
 const MAX_EMBED_LINES: usize = 200;
-/// Cap per side of a rendered edit diff.
-const MAX_DIFF_LINES: usize = 40;
+/// Cap for the LCS matrix sides; larger files fall back to plain content.
+const MAX_LCS_INPUT: usize = 1500;
+/// Cap on rendered diff rows before truncating with a notice.
+const MAX_DIFF_ROWS: usize = 400;
 
-fn cap_lines(text: &str, max: usize) -> String {
+/// A git-style diff line: `-` removed, `+` added, context plain, with the
+/// line numbers it came from / goes to.
+#[derive(Clone, Copy, PartialEq)]
+pub enum DiffKind {
+    Context,
+    Old,
+    New,
+}
+
+pub struct DiffLine {
+    pub kind: DiffKind,
+    pub old_no: Option<u32>,
+    pub new_no: Option<u32>,
+    pub text: String,
+}
+
+impl DiffLine {
+    fn render(&self) -> String {
+        let old = self.old_no.map(|n| format!("{n:>4}")).unwrap_or_else(|| "    ".into());
+        let new = self.new_no.map(|n| format!("{n:>4}")).unwrap_or_else(|| "    ".into());
+        let sign = match self.kind {
+            DiffKind::Context => " ",
+            DiffKind::Old => "-",
+            DiffKind::New => "+",
+        };
+        let text = self.text.lines().next().unwrap_or("");
+        format!("{old} {new} {sign}{text}")
+    }
+}
+
+/// Line diff of two blocks, numbered from `old_start`/`new_start` (1-based
+/// file line numbers when known). Returns None when either side is too big
+/// for the LCS matrix or the sides share no lines at all (fully different).
+pub fn diff_numbered(
+    old: &str,
+    new: &str,
+    old_start: u32,
+    new_start: u32,
+) -> Option<Vec<DiffLine>> {
+    let a: Vec<String> = old.lines().map(str::to_string).collect();
+    let b: Vec<String> = new.lines().map(str::to_string).collect();
+    if a.len() > MAX_LCS_INPUT || b.len() > MAX_LCS_INPUT {
+        return None;
+    }
+    // LCS length table.
+    let mut table = vec![vec![0u32; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            table[i][j] = if a[i] == b[j] {
+                table[i + 1][j + 1] + 1
+            } else {
+                table[i][j + 1].max(table[i + 1][j])
+            };
+        }
+    }
+    if table[0][0] == 0 && !(a.is_empty() && b.is_empty()) {
+        return None; // nothing in common — caller falls back to plain content
+    }
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            out.push(DiffLine {
+                kind: DiffKind::Context,
+                old_no: Some(old_start + i as u32),
+                new_no: Some(new_start + j as u32),
+                text: a[i].clone(),
+            });
+            i += 1;
+            j += 1;
+        } else if table[i + 1][j] >= table[i][j + 1] {
+            out.push(DiffLine {
+                kind: DiffKind::Old,
+                old_no: Some(old_start + i as u32),
+                new_no: None,
+                text: a[i].clone(),
+            });
+            i += 1;
+        } else {
+            out.push(DiffLine {
+                kind: DiffKind::New,
+                old_no: None,
+                new_no: Some(new_start + j as u32),
+                text: b[j].clone(),
+            });
+            j += 1;
+        }
+    }
+    while i < a.len() {
+        out.push(DiffLine {
+            kind: DiffKind::Old,
+            old_no: Some(old_start + i as u32),
+            new_no: None,
+            text: a[i].clone(),
+        });
+        i += 1;
+    }
+    while j < b.len() {
+        out.push(DiffLine {
+            kind: DiffKind::New,
+            old_no: None,
+            new_no: Some(new_start + j as u32),
+            text: b[j].clone(),
+        });
+        j += 1;
+    }
+    Some(out)
+}
+
+/// Locate `needle` inside `file` and return the 1-based line it starts at.
+pub fn find_block_line(file: &str, needle: &str) -> Option<u32> {
+    let first = needle.lines().next()?;
+    let needle_lines: Vec<&str> = needle.lines().collect();
+    let file_lines: Vec<&str> = file.lines().collect();
+    for (idx, line) in file_lines.iter().enumerate() {
+        if line.trim_end() == first.trim_end()
+            && file_lines[idx..].iter().zip(&needle_lines).all(|(f, n)| f.trim_end() == n.trim_end())
+        {
+            return Some(idx as u32 + 1);
+        }
+    }
+    None
+}
+
+/// Truncate a block to `max` lines with a notice, for display.
+pub fn cap_lines(text: &str, max: usize) -> String {
     let count = text.lines().count();
     if count <= max {
         return text.to_string();
@@ -687,44 +814,55 @@ impl ToolBlock {
         self.embedded.set(true);
     }
 
-    /// Show old→new blocks for an edit tool run.
-    pub fn set_embedded_diff(&self, edits: &[(String, String)]) {
-        if edits.is_empty() {
+    /// Render git-style diff rows (grouped runs of same-kind lines share one
+    /// label; `-`/`+` signs and line numbers are baked into the text).
+    pub fn set_embedded_diff(&self, rows: &[DiffLine]) {
+        if rows.is_empty() {
             return;
         }
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
         }
-        for (old, new) in edits {
-            let removed = Label::builder()
-                .label(cap_lines(old, MAX_DIFF_LINES))
-                .xalign(0.0)
-                .yalign(0.0)
-                .wrap(true)
-                .wrap_mode(pango::WrapMode::WordChar)
-                .max_width_chars(88)
-                .hexpand(true)
-                .build();
-            removed.add_css_class("tool-text");
-            removed.add_css_class("monospace");
-            removed.add_css_class("diff-old");
-            self.content.append(&removed);
-
-            let added = Label::builder()
-                .label(cap_lines(new, MAX_DIFF_LINES))
-                .xalign(0.0)
-                .yalign(0.0)
-                .wrap(true)
-                .wrap_mode(pango::WrapMode::WordChar)
-                .max_width_chars(88)
-                .hexpand(true)
-                .build();
-            added.add_css_class("tool-text");
-            added.add_css_class("monospace");
-            added.add_css_class("diff-new");
-            self.content.append(&added);
+        let shown = &rows[..rows.len().min(MAX_DIFF_ROWS)];
+        let mut run: Vec<&DiffLine> = Vec::new();
+        for line in shown {
+            if let Some(last) = run.last() {
+                if last.kind != line.kind {
+                    self.append_diff_run(&run);
+                    run.clear();
+                }
+            }
+            run.push(line);
+        }
+        self.append_diff_run(&run);
+        if rows.len() > MAX_DIFF_ROWS {
+            self.append_result(&format!("… (+{} more diff lines)", rows.len() - MAX_DIFF_ROWS));
         }
         self.embedded.set(true);
+    }
+
+    fn append_diff_run(&self, run: &[&DiffLine]) {
+        if run.is_empty() {
+            return;
+        }
+        let text = run.iter().map(|l| l.render()).collect::<Vec<_>>().join("\n");
+        let label = Label::builder()
+            .label(text)
+            .xalign(0.0)
+            .yalign(0.0)
+            .wrap(true)
+            .wrap_mode(pango::WrapMode::WordChar)
+            .max_width_chars(96)
+            .hexpand(true)
+            .build();
+        label.add_css_class("tool-text");
+        label.add_css_class("monospace");
+        label.add_css_class(match run[0].kind {
+            DiffKind::Old => "diff-old",
+            DiffKind::New => "diff-new",
+            DiffKind::Context => "diff-ctx",
+        });
+        self.content.append(&label);
     }
 
     /// Whether the body already carries embedded content (append results).
@@ -849,5 +987,39 @@ impl ChatView {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_numbers_context_and_changes() {
+        let old = "fn answer() -> i32 {\n    2 + 2\n}\n\nfn old_helper() {\n    todo!()\n}\n";
+        let new = "fn answer() -> i32 {\n    2 + 2\n}\n\n#[cfg(test)]\nmod tests {\n}\n";
+        let rows = diff_numbered(old, new, 1, 1).expect("diff exists");
+        let rendered: Vec<String> = rows.iter().map(|l| l.render()).collect();
+        // Shared prefix keeps its line numbers on both sides, unmarked.
+        assert_eq!(rendered[0], "   1    1  fn answer() -> i32 {");
+        assert_eq!(rendered[1], "   2    2      2 + 2");
+        // Removed lines carry only their old number with a minus sign.
+        assert!(rendered.iter().any(|l| l == "   5      -fn old_helper() {"));
+        // Added lines carry only their new number with a plus sign.
+        assert!(rendered.iter().any(|l| l == "        5 +#[cfg(test)]"));
+        // Context after the change renumbers on both sides.
+        assert!(rows.last().unwrap().old_no.is_some() && rows.last().unwrap().new_no.is_some());
+    }
+
+    #[test]
+    fn diff_returns_none_for_fully_different_blocks() {
+        assert!(diff_numbered("a\nb\nc", "1\n2\n3", 1, 1).is_none());
+    }
+
+    #[test]
+    fn block_line_finds_nested_position() {
+        let file = "line one\nline two\nfn run() {\n    body();\n}\n";
+        assert_eq!(find_block_line(file, "fn run() {\n    body();\n}"), Some(3));
+        assert_eq!(find_block_line(file, "not present"), None);
     }
 }
