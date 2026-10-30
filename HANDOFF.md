@@ -1,8 +1,9 @@
 # pi-gui — HANDOFF
 
-State as of 2026-10-27 (evening). Three rounds committed: the layout/retry fixes, the
-feedback batch (spinners, gear, toast pruning, edit, loading states), and the
-markdown + per-session tabs round. Read this before touching the code.
+State as of 2026-10-30. Four rounds committed: the layout/retry fixes, the feedback
+batch (spinners, gear, toast pruning, edit, loading states), the markdown +
+per-session tabs round, and the centered-column + welcome round. Read this before
+touching the code.
 
 ## What this is
 
@@ -15,6 +16,27 @@ reasoning, tool cards), no web stack.
 - Layout: `src/main.rs` (app entry + CSS load), `src/app.rs` (PiWindow/State, event
   handling), `src/rpc.rs` (child process + JSONL protocol), `src/chat.rs` (transcript
   widgets), `src/session_list.rs` (sidebar), `src/style.rs` (all CSS)
+
+## Feature batch #4 (2026-10-30) — centered column + welcome — all verified
+
+1. **Centered conversation column** — the transcript list AND the input card are
+   wrapped in `AdwClamp` (`COLUMN_MAX_WIDTH = 760` in chat.rs): on windows wider
+   than the cap both tighten and center symmetrically, Claude/ChatGPT-desktop
+   style. The user's 1100-wide default window (content ~819) gets ~30px insets;
+   wide windows get proportionally more. Do NOT replace the clamp with
+   margin-setting closures — `connect_notify(Some("width"))` never fired in
+   practice (verified: margins stayed 0 at width 743).
+2. **Per-tab welcome (empty state)** — a transcript with no rows shows a centered
+   greeting row (π avatar, "How can I help?", subtitle) IN THE LIST (not an
+   overlay: broadway renders overlay children as a featureless slab). Toggled
+   automatically by `ChatView::append` (hide) / `clear` + `remove_row` (show when
+   the list empties again) — callers don't manage it.
+3. **Tab bar always visible** — `tab_bar.set_autohide(false)`: a single session
+   still shows its tab, so the multi-session tabs stay discoverable.
+4. **Stuck tab spinner fixed** — `TabPage::set_loading` was only ever cleared by
+   AgentSettled/prompt-failure; a chat that never ran a turn (fresh/empty session)
+   spun forever. Now `load_state_done` and `load_history_done` set
+   `page.set_loading(chat.busy)`; the switch flow sets it true again up front.
 
 ## Feature batch #3 (2026-10-27) — markdown, zero toasts, tabs — all verified
 
@@ -95,12 +117,14 @@ All 8 `cargo test --release` tests green (3 rpc wire/bridge, 3 diff engine,
 ## Testing recipes
 
 - fake-pi.py (no network) is at `/tmp/ai-agent/fake-pi.py` — recreate from the spec
-  below if /tmp got wiped; `chmod +x` it or the GUI panics with PermissionDenied at
-  `app.rs` spawn. It has two scripted scenarios selected by the switched session path:
-  `fake-ui-test.jsonl` (thinking + text + tool + answer) and `fake-ui-retry.jsonl`
-  (two retries then final failure). Sensitive to timing: the GUI auto-switches ~1s
-  after start, scenarios start 2s later; when verifying transient states make the
-  sleeps LONG (60s) — browser tab connect alone can take 30s+.
+  below if /tmp got wiped (it DID get wiped once); `chmod +x` it or the GUI panics
+  with PermissionDenied at `app.rs` spawn. Scripted scenarios selected by the
+  switched session path: `fake-ui-test.jsonl` (thinking + text + read/write/edit +
+  final markdown answer), `fake-ui-retry.jsonl` (two retries then final failure),
+  `fake-ui-empty.jsonl` (no events at all — empty transcript, welcome state shows).
+  Timing-sensitive: the GUI auto-switches ~1s after start, scenarios start 2s later;
+  when verifying transient states make the sleeps LONG — browser tab connect alone
+  can take 30s+.
 - Fake session files: `~/.pi/agent/sessions/--tmp-ai-agent--/fake-ui-{test,retry}.jsonl`,
   each containing one line `{"type":"session_info","name":"<display name>"}` so the
   sidebar picks a label. gio trash them when done (they pollute the real sidebar).
@@ -113,6 +137,20 @@ All 8 `cargo test --release` tests green (3 rpc wire/bridge, 3 diff engine,
   missing. Call `tab.setViewportSize({width: 1280, height: 1000})` on the TAB (not
   `tab.playwright.*`) BEFORE `goto`, and don't resize an already-rendered broadway
   page — the resize wedges frame delivery (screenshot times out; restart required).
+- **broadway screen is 1024×768** — the window clamps to it regardless of
+  `default_width`; wide-window behavior can't be screenshotted directly. To verify
+  max-width logic, temporarily lower the cap (e.g. 560) so the insets show at
+  1024, then restore.
+- **Phantom slab**: a uniform slightly-darker rectangle in screenshots with NO
+  matching widget in a tree dump is a stale broadway canvas artifact (it survives
+  app restarts, correlates with nothing, disappears on a different display). Don't
+  chase it in the app — restart broadwayd on a fresh display (e.g. `:3` / port
+  8092) and re-screenshot.
+- **Widgets may render invisible inside broadway layers**: when a widget's
+  contents don't show, first dump the tree (names, classes, allocations, absolute
+  rects) and check whether the tree is correct before believing the screenshot;
+  the loud-background-color trick (temporary CSS class with red/green background)
+  split "widget missing" from "render missing" in one run.
 
 ### fake-pi.py spec (recreate if lost)
 

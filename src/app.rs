@@ -130,8 +130,9 @@ impl ChatSession {
         loading_row.append(&loading_inner);
         loading_row.set_visible(false);
 
-        // The tab shows just the transcript; the input bar below the tab bar
-        // is shared and acts on the selected tab.
+        // The tab shows just the transcript (with the empty-state greeting
+        // while there are no messages); the input bar below is shared and acts
+        // on the selected tab.
         let page = tabs.append(&chat_view.scrolled);
         page.set_title("New chat");
 
@@ -372,6 +373,9 @@ impl PiWindow {
         let tab_bar = TabBar::new();
         tab_bar.set_view(Some(&tabs));
         tab_bar.set_hexpand(true);
+        // Keep the bar visible even with a single tab so the multi-session
+        // tabs stay discoverable.
+        tab_bar.set_autohide(false);
         chat_page.append(&tab_bar);
         chat_page.append(&tabs);
 
@@ -435,7 +439,14 @@ impl PiWindow {
         input_card.append(&input_overlay);
         input_card.append(&stop_button);
         input_card.append(&send_button);
-        chat_page.append(&input_card);
+        // The input card tracks the conversation column: same clamp, so both
+        // tighten and center together.
+        let input_clamp = libadwaita::Clamp::builder()
+            .maximum_size(chat::COLUMN_MAX_WIDTH)
+            .tightening_threshold(chat::COLUMN_MAX_WIDTH)
+            .child(&input_card)
+            .build();
+        chat_page.append(&input_clamp);
 
         stack.add_titled(&chat_page, Some("chat"), "Chat");
 
@@ -869,6 +880,7 @@ impl State {
         chat.chat_view.clear();
         chat.chat_view.append(&chat.loading_row);
         chat.loading_row.set_visible(true);
+        chat.page.set_loading(true);
         chat.switch_started = Some(std::time::Instant::now());
         let receiver = chat.rpc.send(PiCommand::SwitchSession { session_path: id.to_string() });
         chat.pending = Pending::SwitchSession(receiver);
@@ -1145,14 +1157,14 @@ impl State {
                         chat.pending = Pending::GetMessages(chat.rpc.send(PiCommand::GetMessages));
                     } else {
                         chat.loading_row.set_visible(false);
-                        chat.chat_view.list.remove(&chat.loading_row);
+                        chat.chat_view.remove_row(&chat.loading_row);
                         self.refresh_chat_ui();
                     }
                 }
                 Err(TryRecvError::Empty) => chat.pending = Pending::SwitchSession(recv),
                 Err(TryRecvError::Disconnected) => {
                     chat.loading_row.set_visible(false);
-                    chat.chat_view.list.remove(&chat.loading_row);
+                    chat.chat_view.remove_row(&chat.loading_row);
                     eprintln!("[pi-gui] session switch failed — RPC bridge died");
                 }
             },
@@ -1166,7 +1178,10 @@ impl State {
 
     fn load_history_done(&mut self, chat: &mut ChatSession, value: &Value) {
         chat.loading_row.set_visible(false);
-        chat.chat_view.list.remove(&chat.loading_row);
+        chat.chat_view.remove_row(&chat.loading_row);
+        // The switch is complete; a turn that already started keeps the
+        // spinner, an idle chat drops it.
+        chat.page.set_loading(chat.busy);
         if let Some(started) = chat.switch_started.take() {
             let render_start = std::time::Instant::now();
             let count = value
@@ -1351,6 +1366,8 @@ impl State {
 
         // Thinking levels for the current model.
         chat.pending_levels = Some(chat.rpc.send(PiCommand::GetAvailableThinkingLevels));
+        // A fresh chat never runs a switch/turn; drop its startup spinner.
+        chat.page.set_loading(chat.busy);
         self.refresh_chat_ui();
     }
 
@@ -1700,7 +1717,7 @@ impl State {
                 // that already followed it stay in order.
                 chat.chat_view.list.insert_child_after(&bubble.box_, Some(&streaming.container));
             }
-            chat.chat_view.list.remove(&streaming.container);
+            chat.chat_view.remove_row(&streaming.container);
             // The swap changes heights after the last append scrolled; land on
             // the final bubble, not wherever the removed bubble left the view.
             chat.chat_view.scroll_to_bottom();

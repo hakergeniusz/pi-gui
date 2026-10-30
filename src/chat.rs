@@ -6,10 +6,16 @@
 //! is a collapsible dimmed block, and tool runs render as cards with a
 //! monospace result body.
 
-use gtk4::prelude::*;
+use libadwaita::prelude::*;
 use gtk4::{
-    Align, Box, Button, Image, Label, Orientation, Revealer, ScrolledWindow, Spinner, ToggleButton,
+    Align, Box, Button, Image, Label, Orientation, Revealer, ScrolledWindow, Spinner,
+    ToggleButton,
 };
+
+/// Widest the conversation column (transcript rows and the input card) gets
+/// on wide windows; extra space splits evenly into side insets, like Claude /
+/// ChatGPT desktop.
+pub const COLUMN_MAX_WIDTH: i32 = 760;
 
 /// A single rendered chat message row.
 pub struct MessageBubble {
@@ -956,6 +962,51 @@ impl ToolBlock {
 pub struct ChatView {
     pub scrolled: ScrolledWindow,
     pub list: Box,
+    empty_state: Box,
+}
+
+/// Centered greeting row shown while a transcript has no rows. Lives in the
+/// list itself (not an overlay) so it renders everywhere the list does.
+fn build_empty_state() -> Box {
+    let state = Box::builder()
+        .orientation(Orientation::Vertical)
+        .halign(Align::Center)
+        .hexpand(true)
+        .spacing(16)
+        .margin_top(180)
+        .build();
+
+    let avatar_circle = Box::builder()
+        .orientation(Orientation::Vertical)
+        .halign(Align::Center)
+        .width_request(64)
+        .height_request(64)
+        .css_classes(["welcome-avatar"])
+        .build();
+    let avatar = Label::builder()
+        .label("π")
+        .halign(Align::Center)
+        .valign(Align::Center)
+        .build();
+    avatar.add_css_class("welcome-avatar-label");
+    avatar_circle.append(&avatar);
+
+    let title = Label::builder().label("How can I help?").halign(Align::Center).build();
+    title.add_css_class("welcome-title");
+
+    let subtitle = Label::builder()
+        .label("Ask pi to write, explain, or fix code with the pi coding agent.")
+        .halign(Align::Center)
+        .wrap(true)
+        .max_width_chars(42)
+        .justify(gtk4::Justification::Center)
+        .build();
+    subtitle.add_css_class("welcome-subtitle");
+
+    state.append(&avatar_circle);
+    state.append(&title);
+    state.append(&subtitle);
+    state
 }
 
 impl ChatView {
@@ -968,12 +1019,20 @@ impl ChatView {
             .css_classes(["chat-list"])
             .build();
 
+        // Keep the conversation in a centered column: AdwClamp tightens the
+        // list to COLUMN_MAX_WIDTH and centers it on wider windows.
+        let column = libadwaita::Clamp::builder()
+            .maximum_size(COLUMN_MAX_WIDTH)
+            .tightening_threshold(COLUMN_MAX_WIDTH)
+            .child(&list)
+            .build();
+
         let scrolled = ScrolledWindow::builder()
             .hexpand(true)
             .vexpand(true)
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vscrollbar_policy(gtk4::PolicyType::Automatic)
-            .child(&list)
+            .child(&column)
             .build();
         scrolled.add_css_class("chat-scroll");
 
@@ -996,12 +1055,35 @@ impl ChatView {
             }
         });
 
-        Self { scrolled, list }
+        let empty_state = build_empty_state();
+        Self { scrolled, list, empty_state }
     }
 
     pub fn append(&self, widget: &impl IsA<gtk4::Widget>) {
+        self.hide_empty_state();
         self.list.append(widget);
         self.scroll_to_bottom();
+    }
+
+    /// Remove a row that was appended directly; the greeting comes back when
+    /// this empties the transcript (e.g. the loading row).
+    pub fn remove_row(&self, widget: &impl IsA<gtk4::Widget>) {
+        self.list.remove(widget);
+        if self.list.first_child().is_none() {
+            self.show_empty_state();
+        }
+    }
+
+    fn show_empty_state(&self) {
+        if self.empty_state.parent().is_none() {
+            self.list.append(&self.empty_state);
+        }
+    }
+
+    fn hide_empty_state(&self) {
+        if self.empty_state.parent().is_some() {
+            self.list.remove(&self.empty_state);
+        }
     }
 
     pub fn scroll_to_bottom(&self) {
@@ -1021,6 +1103,7 @@ impl ChatView {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
+        self.show_empty_state();
     }
 }
 

@@ -243,7 +243,7 @@ window {
     border: 1px solid alpha(@window_fg_color, 0.11);
     border-radius: 16px;
     padding: 6px 6px 6px 4px;
-    margin: 6px 16px 16px;
+    margin: 6px 0 16px;
 }
 
 .input-card:focus-within {
