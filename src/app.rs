@@ -26,6 +26,9 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 type Value = serde_json::Value;
 
+/// Tallest the prompt entry grows before it starts scrolling internally.
+const INPUT_MAX_HEIGHT: i32 = 180;
+
 /// One selectable model in the header dropdown.
 #[derive(Clone)]
 struct ModelInfo {
@@ -97,6 +100,11 @@ struct ChatSession {
     /// When the current session switch started (for stderr timing logs).
     switch_started: Option<std::time::Instant>,
 
+    /// When the current turn's prompt was sent (time-to-first-token start).
+    turn_started: Option<std::time::Instant>,
+    /// When the first token (thinking or text delta) of the turn arrived.
+    first_token_at: Option<std::time::Instant>,
+
     thinking_levels: Vec<String>,
     current_thinking_level: Option<String>,
 
@@ -155,6 +163,8 @@ impl ChatSession {
             current_session_file: None,
             suppress_autocompact: Rc::new(Cell::new(false)),
             switch_started: None,
+            turn_started: None,
+            first_token_at: None,
             thinking_levels: Vec::new(),
             current_thinking_level: None,
             page,
@@ -373,9 +383,9 @@ impl PiWindow {
         let tab_bar = TabBar::new();
         tab_bar.set_view(Some(&tabs));
         tab_bar.set_hexpand(true);
-        // Keep the bar visible even with a single tab so the multi-session
-        // tabs stay discoverable.
-        tab_bar.set_autohide(false);
+        // Autohide stays on (the libadwaita default): with a single session no
+        // bar is drawn, matching GNOME document-app conventions; it appears
+        // only once a second session is open.
         chat_page.append(&tab_bar);
         chat_page.append(&tabs);
 
@@ -393,8 +403,6 @@ impl PiWindow {
             .vexpand(false)
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vscrollbar_policy(gtk4::PolicyType::Automatic)
-            .propagate_natural_height(true)
-            .max_content_height(180)
             .build();
 
         let input_view = TextView::builder()
@@ -406,6 +414,39 @@ impl PiWindow {
         let input_buffer = input_view.buffer();
 
         input_scrolled.set_child(Some(&input_view));
+
+        // Auto-size the entry to its content: one line when empty, growing as
+        // the prompt wraps, capped so very long prompts scroll inside the
+        // card. Re-measured on buffer edits and on viewport resizes (via the
+        // horizontal adjustment, whose page size tracks the wrapping width);
+        // the last-height cell keeps the setting idempotent so re-layouts
+        // can't feed back into themselves.
+        let resize_input: Rc<dyn Fn()> = {
+            let view = input_view.clone();
+            let target = input_scrolled.clone();
+            let last = Rc::new(Cell::new(-1));
+            Rc::new(move || {
+                let width = view.width();
+                let (_, natural, _, _) = view.measure(
+                    Orientation::Vertical,
+                    if width > 0 { width } else { -1 },
+                );
+                let height = natural.min(INPUT_MAX_HEIGHT);
+                if last.get() != height {
+                    last.set(height);
+                    target.set_height_request(height);
+                }
+            })
+        };
+        {
+            let resize = resize_input.clone();
+            input_buffer.connect_changed(move |_| resize());
+        }
+        {
+            let resize = resize_input.clone();
+            input_scrolled.hadjustment().connect_changed(move |_| resize());
+        }
+        resize_input();
 
         // TextView has no placeholder support: overlay a dim label shown while
         // the buffer is empty.
@@ -831,6 +872,16 @@ fn shorten_for_display(text: &str, max: usize) -> String {
     out
 }
 
+/// Human duration for the metrics caption: "0.8 s", "12 s".
+fn fmt_secs(d: std::time::Duration) -> String {
+    let s = d.as_secs_f64();
+    if s < 10.0 {
+        format!("{s:.1} s")
+    } else {
+        format!("{s:.0} s")
+    }
+}
+
 // ================= state actions =================
 
 impl State {
@@ -1061,6 +1112,8 @@ impl State {
 
             chat.busy = true;
             chat.page.set_loading(true);
+            chat.turn_started = Some(std::time::Instant::now());
+            chat.first_token_at = None;
             let receiver = chat.rpc.send(PiCommand::Prompt { message: trimmed });
             chat.pending = Pending::Prompt(receiver);
         }
@@ -1133,7 +1186,7 @@ impl State {
                         eprintln!("[pi-gui] prompt failed: {err}");
                         chat.busy = false;
                         chat.page.set_loading(false);
-                        self.finalize_streaming(chat, None, None);
+                        self.finalize_streaming(chat, None, None, None);
                         self.refresh_chat_ui();
                     }
                 }
@@ -1142,7 +1195,7 @@ impl State {
                     eprintln!("[pi-gui] prompt failed — RPC bridge died");
                     chat.busy = false;
                     chat.page.set_loading(false);
-                    self.finalize_streaming(chat, None, None);
+                    self.finalize_streaming(chat, None, None, None);
                     self.refresh_chat_ui();
                 }
             },
@@ -1231,7 +1284,8 @@ impl State {
                     let thinking = if thinking.is_empty() { None } else { Some(thinking.as_str()) };
                     let with_header = prev_role.as_deref() != Some("assistant");
                     chat.chat_view.append(
-                        &chat::assistant_message(&text, thinking, time, with_header, None).box_,
+                        &chat::assistant_message(&text, thinking, time, with_header, None, None)
+                            .box_,
                     );
                     prev_role = Some("assistant".into());
                 }
@@ -1454,7 +1508,7 @@ impl State {
                 if let Some(file) = chat.current_session_file.clone() {
                     self.session_list.set_busy(&file, false);
                 }
-                self.finalize_streaming(chat, None, None);
+                self.finalize_streaming(chat, None, None, None);
                 chat.chat_view.scroll_to_bottom();
                 self.refresh_chat_ui();
             }
@@ -1491,7 +1545,13 @@ impl State {
                         let text = content_text(&content);
                         let thinking = content_thinking(&content);
                         let thinking = if thinking.is_empty() { None } else { Some(thinking) };
-                        self.finalize_streaming(chat, Some(&text), thinking.as_deref());
+                        // Real pi reports output tokens in the final message's
+                        // usage; when absent the estimate falls back to chars/4.
+                        let usage_output = message
+                            .pointer("/usage/output")
+                            .and_then(|v| v.as_f64())
+                            .map(|t| t as u64);
+                        self.finalize_streaming(chat, Some(&text), thinking.as_deref(), usage_output);
                     }
                 }
             }
@@ -1593,7 +1653,7 @@ impl State {
                 let err = final_error.clone().unwrap_or_default();
                 // Flush any partial streamed content, then leave a permanent
                 // error row in the transcript.
-                self.finalize_streaming(chat, None, None);
+                self.finalize_streaming(chat, None, None, None);
                 let err = if err.is_empty() {
                     "The provider failed after repeated retries.".to_string()
                 } else {
@@ -1646,6 +1706,9 @@ impl State {
             "text_delta" => {
                 if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
                     self.ensure_streaming(chat, !chat.turn_header_shown);
+                    if chat.first_token_at.is_none() {
+                        chat.first_token_at = Some(std::time::Instant::now());
+                    }
                     if let Some(streaming) = chat.streaming.as_ref() {
                         streaming.append_text(delta);
                     }
@@ -1655,6 +1718,9 @@ impl State {
             "thinking_delta" => {
                 if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
                     self.ensure_streaming(chat, !chat.turn_header_shown);
+                    if chat.first_token_at.is_none() {
+                        chat.first_token_at = Some(std::time::Instant::now());
+                    }
                     if let Some(streaming) = chat.streaming.as_ref() {
                         streaming.append_thinking(delta);
                     }
@@ -1700,18 +1766,51 @@ impl State {
 
     /// Replace the streaming bubble with a final assistant bubble. With
     /// `text: None` any dangling streaming bubble is just removed.
-    fn finalize_streaming(&mut self, chat: &mut ChatSession, text: Option<&str>, thinking: Option<&str>) {
+    /// `usage_tokens` is the provider-reported output-token count when known;
+    /// otherwise throughput is estimated from streamed characters (chars/4).
+    fn finalize_streaming(
+        &mut self,
+        chat: &mut ChatSession,
+        text: Option<&str>,
+        thinking: Option<&str>,
+        usage_tokens: Option<u64>,
+    ) {
         if let Some(streaming) = chat.streaming.take() {
             let text = text.unwrap_or("");
             let thinking = thinking.unwrap_or("");
             let has_content = !text.is_empty() || !thinking.is_empty();
             if has_content {
+                // Turn metrics: time to first token (once per turn, on the
+                // header row) and this message's throughput.
+                let mut parts: Vec<String> = Vec::new();
+                if streaming.has_header {
+                    if let (Some(sent), Some(first)) = (chat.turn_started, chat.first_token_at) {
+                        parts.push(format!(
+                            "{} to first token",
+                            fmt_secs(first.duration_since(sent))
+                        ));
+                    }
+                }
+                if let Some(started) = streaming.stream_started() {
+                    let dur = started.elapsed().as_secs_f64();
+                    if dur > 0.05 {
+                        let toks = usage_tokens
+                            .map(|t| t as f64)
+                            .unwrap_or_else(|| (streaming.chars_streamed().max(1) as f64) / 4.0);
+                        let rate = (toks / dur).round() as u64;
+                        if rate >= 1 {
+                            parts.push(format!("{rate} tok/s"));
+                        }
+                    }
+                }
+                let metrics = if parts.is_empty() { None } else { Some(parts.join(" · ")) };
                 let bubble = chat::assistant_message(
                     text,
                     if thinking.is_empty() { None } else { Some(thinking) },
                     None,
                     streaming.has_header,
                     streaming.thought_secs(),
+                    metrics.as_deref(),
                 );
                 // Insert at the streaming bubble's position so tool blocks
                 // that already followed it stay in order.
@@ -1719,8 +1818,9 @@ impl State {
             }
             chat.chat_view.remove_row(&streaming.container);
             // The swap changes heights after the last append scrolled; land on
-            // the final bubble, not wherever the removed bubble left the view.
-            chat.chat_view.scroll_to_bottom();
+            // the final bubble — including its metrics caption — not wherever
+            // the removed bubble left the view.
+            chat.chat_view.scroll_to_bottom_settled();
         }
     }
 

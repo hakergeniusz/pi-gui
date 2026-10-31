@@ -296,13 +296,15 @@ pub fn user_message(
 /// reasoning block, and selectable answer text. `with_header` is false for
 /// follow-up assistant rows inside the same turn so the header appears only
 /// once under the user's message. `thought_secs` labels the reasoning toggle
-/// when the thinking duration is known (live runs).
+/// when the thinking duration is known (live runs). `metrics` renders a dim
+/// caption line ("1.2 s to first token · 41 tok/s") under the answer.
 pub fn assistant_message(
     text: &str,
     thinking: Option<&str>,
     time: Option<&str>,
     with_header: bool,
     thought_secs: Option<u64>,
+    metrics: Option<&str>,
 ) -> MessageBubble {
     let container = Box::builder()
         .orientation(Orientation::Vertical)
@@ -342,6 +344,17 @@ pub fn assistant_message(
         label.set_markup(&markdown_to_pango(text));
         label.add_css_class("message-text");
         container.append(&label);
+    }
+
+    if let Some(metrics) = metrics.filter(|m| !m.is_empty()) {
+        let footer = Label::builder()
+            .label(metrics)
+            .xalign(0.0)
+            .halign(Align::Start)
+            .margin_top(2)
+            .build();
+        footer.add_css_class("stream-status");
+        container.append(&footer);
     }
 
     MessageBubble { box_: container }
@@ -395,6 +408,14 @@ pub struct StreamingBubble {
     thinking_started: std::cell::Cell<Option<std::time::Instant>>,
     /// How long the thinking phase took, once it finished.
     thought_secs: std::cell::Cell<Option<u64>>,
+    /// When the first delta (thinking or text) of this message arrived — the
+    /// start of the measured streaming span for throughput.
+    stream_started: std::cell::Cell<Option<std::time::Instant>>,
+    /// Thinking text accumulated while streaming (raw chars feed the tok/s
+    /// estimate when the provider doesn't report usage).
+    thinking_text: std::cell::RefCell<String>,
+    /// Last throughput value shown in the status line (avoids label churn).
+    tok_shown: std::cell::Cell<u64>,
     /// Raw (unrendered) answer text accumulated while streaming.
     raw_text: std::cell::RefCell<String>,
 }
@@ -458,6 +479,9 @@ impl StreamingBubble {
             has_header: with_header,
             thinking_started: std::cell::Cell::new(None),
             thought_secs: std::cell::Cell::new(None),
+            stream_started: std::cell::Cell::new(None),
+            thinking_text: std::cell::RefCell::new(String::new()),
+            tok_shown: std::cell::Cell::new(0),
             raw_text: std::cell::RefCell::new(String::new()),
         }
     }
@@ -486,6 +510,41 @@ impl StreamingBubble {
         }
     }
 
+    /// Note the streaming span start on the first delta of the message.
+    fn note_stream_start(&self) {
+        if self.stream_started.get().is_none() {
+            self.stream_started.set(Some(std::time::Instant::now()));
+        }
+    }
+
+    /// When the first delta of this message arrived.
+    pub fn stream_started(&self) -> Option<std::time::Instant> {
+        self.stream_started.get()
+    }
+
+    /// Raw characters streamed for this message (thinking + answer), feeding
+    /// the tokens/second estimate when the provider doesn't report usage.
+    pub fn chars_streamed(&self) -> usize {
+        self.raw_text.borrow().len() + self.thinking_text.borrow().len()
+    }
+
+    /// Reflect the current throughput in the "Thinking…" status line. Rough
+    /// chars/4 token estimate — a live hint, the finalized bubble reports the
+    /// provider's usage when it has one.
+    fn update_live_throughput(&self) {
+        let Some(started) = self.stream_started.get() else { return };
+        let elapsed = started.elapsed().as_secs_f64();
+        if elapsed < 1.0 {
+            return;
+        }
+        let toks = (self.chars_streamed() as f64 / 4.0).max(1.0);
+        let rate = (toks / elapsed).round() as u64;
+        if rate != self.tok_shown.get() {
+            self.tok_shown.set(rate);
+            self.status_label.set_text(&format!("Thinking… · {rate} tok/s"));
+        }
+    }
+
     /// Show a persistent retry notice in the status line (the provider failed
     /// and pi is retrying — otherwise the UI would sit silently on
     /// "Thinking…").
@@ -511,6 +570,7 @@ impl StreamingBubble {
     }
 
     pub fn append_text(&self, text: &str) {
+        self.note_stream_start();
         self.text_started();
         // Keep the raw accumulation — the label renders Pango markup, so
         // reading it back would give the styled text, not the source.
@@ -520,6 +580,7 @@ impl StreamingBubble {
     }
 
     pub fn set_text(&self, text: &str) {
+        self.note_stream_start();
         if !text.is_empty() {
             self.text_started();
         }
@@ -528,13 +589,18 @@ impl StreamingBubble {
     }
 
     pub fn append_thinking(&self, text: &str) {
+        self.note_stream_start();
         if self.thinking_started.get().is_none() {
             self.thinking_started.set(Some(std::time::Instant::now()));
         }
+        self.thinking_text.borrow_mut().push_str(text);
         self.reasoning.append(text);
+        self.update_live_throughput();
     }
 
     pub fn set_thinking(&self, text: &str) {
+        self.note_stream_start();
+        *self.thinking_text.borrow_mut() = text.to_string();
         self.reasoning.set_text(text);
     }
 }
@@ -1016,6 +1082,10 @@ impl ChatView {
             .hexpand(true)
             .vexpand(true)
             .spacing(0)
+            // Breathing room under the last message; also keeps the metrics
+            // caption of a finalized turn out of the viewport's bottom edge,
+            // where it would sit flush under the input card.
+            .margin_bottom(24)
             .css_classes(["chat-list"])
             .build();
 
@@ -1095,6 +1165,28 @@ impl ChatView {
         let adjustment = self.scrolled.vadjustment();
         glib::idle_add_local(move || {
             adjustment.set_value(adjustment.upper() - adjustment.page_size());
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// Scroll after idle passes, forcing the scrolled window to re-measure.
+    /// The finalize swap removes the streaming row and inserts the final
+    /// bubble in one tick; the bubble's late height change (metrics caption)
+    /// can outlive the adjustment update, leaving vadjustment.upper stale by
+    /// the caption's height — the caption then sits past the maximum scroll
+    /// and can never be scrolled into view. queue_resize forces the scrolled
+    /// window to re-read the list's height before the final landing pass.
+    pub fn scroll_to_bottom_settled(&self) {
+        let list = self.list.clone();
+        let adjustment = self.scrolled.vadjustment();
+        glib::idle_add_local(move || {
+            adjustment.set_value(adjustment.upper() - adjustment.page_size());
+            list.queue_resize();
+            let adjustment = adjustment.clone();
+            glib::idle_add_local(move || {
+                adjustment.set_value(adjustment.upper() - adjustment.page_size());
+                glib::ControlFlow::Break
+            });
             glib::ControlFlow::Break
         });
     }

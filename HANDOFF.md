@@ -1,9 +1,10 @@
 # pi-gui — HANDOFF
 
-State as of 2026-10-30. Four rounds committed: the layout/retry fixes, the feedback
+State as of 2026-10-31. Five rounds committed: the layout/retry fixes, the feedback
 batch (spinners, gear, toast pruning, edit, loading states), the markdown +
-per-session tabs round, and the centered-column + welcome round. Read this before
-touching the code.
+per-session tabs round, the centered-column + welcome round, and the GNOME
+tab-bar + autosizing input + TTFT/throughput round. Read this before touching
+the code.
 
 ## What this is
 
@@ -16,6 +17,32 @@ reasoning, tool cards), no web stack.
 - Layout: `src/main.rs` (app entry + CSS load), `src/app.rs` (PiWindow/State, event
   handling), `src/rpc.rs` (child process + JSONL protocol), `src/chat.rs` (transcript
   widgets), `src/session_list.rs` (sidebar), `src/style.rs` (all CSS)
+
+## Feature batch #5 (2026-10-31) — tab bar, input autosize, TTFT/throughput — all verified
+
+1. **Tab bar autohide (GNOME HIG)** — REVERTS batch #4 item 3: `set_autohide(false)`
+   is gone, the libadwaita default is back. One session → no tab bar; 2+ sessions →
+   bar appears. Verified both states under Xvfb (shots S1–S4 single-session, T1
+   two-session).
+2. **Autosizing input card** — one line when empty, grows with its content up to
+   `INPUT_MAX_HEIGHT = 180` (app.rs). `resize_input` (Rc closure) measures the
+   TextView vertically at the current viewport width, applies `.min(cap)`, guarded
+   by a `Cell<i32>` last-height check; connected to buffer `changed` AND the
+   scrolled window's `hadjustment::changed` (width changes re-measure). Replaces
+   `propagate_natural_height`/`max_content_height`, which only grew after the
+   card's internal scrollbar appeared.
+3. **TTFT + throughput** — `turn_started` stamped at send, `first_token_at` on the
+   first thinking/text delta; TTFT = first token − send, rendered as "N.N s to
+   first token" on the turn's FIRST message only (`has_header`). Throughput =
+   `usage.output` tokens ÷ stream seconds when message_end carries usage, else a
+   chars/4 fallback. Finalized messages get a dim "N tok/s" footer
+   (`assistant_message(..., metrics)`); the thinking status line reads
+   "Thinking… · N tok/s" live from 1s elapsed. `finalize_streaming(...,
+   usage_tokens)` builds the string; the finalize swap ends with
+   `scroll_to_bottom_settled()` (see recipes for why).
+   Verified: live "Thinking… · 4 tok/s" (S3) and settled "20 tok/s" caption (S4)
+   visually; the TTFT string was proven end-to-end via logs and shares the footer
+   code path — the mid-turn Xvfb frame itself was stale (see recipes).
 
 ## Feature batch #4 (2026-10-30) — centered column + welcome — all verified
 
@@ -31,8 +58,8 @@ reasoning, tool cards), no web stack.
    overlay: broadway renders overlay children as a featureless slab). Toggled
    automatically by `ChatView::append` (hide) / `clear` + `remove_row` (show when
    the list empties again) — callers don't manage it.
-3. **Tab bar always visible** — `tab_bar.set_autohide(false)`: a single session
-   still shows its tab, so the multi-session tabs stay discoverable.
+3. **Tab bar always visible** — SUPERSEDED by batch #5 item 1 (user wanted GNOME HIG
+   behavior): autohide is back; a single session shows no tab bar.
 4. **Stuck tab spinner fixed** — `TabPage::set_loading` was only ever cleared by
    AgentSettled/prompt-failure; a chat that never ran a turn (fresh/empty session)
    spun forever. Now `load_state_done` and `load_history_done` set
@@ -118,39 +145,39 @@ All 8 `cargo test --release` tests green (3 rpc wire/bridge, 3 diff engine,
 
 - fake-pi.py (no network) is at `/tmp/ai-agent/fake-pi.py` — recreate from the spec
   below if /tmp got wiped (it DID get wiped once); `chmod +x` it or the GUI panics
-  with PermissionDenied at `app.rs` spawn. Scripted scenarios selected by the
-  switched session path: `fake-ui-test.jsonl` (thinking + text + read/write/edit +
-  final markdown answer), `fake-ui-retry.jsonl` (two retries then final failure),
+  with PermissionDenied at `app.rs` spawn. Scenario selection by the ACTIVE session
+  path suffix: `fake-ui-test.jsonl` (thinking + text + read/write/edit + final
+  markdown answer), `fake-ui-retry.jsonl` (two retries then final failure),
   `fake-ui-empty.jsonl` (no events at all — empty transcript, welcome state shows).
-  Timing-sensitive: the GUI auto-switches ~1s after start, scenarios start 2s later;
-  when verifying transient states make the sleeps LONG — browser tab connect alone
-  can take 30s+.
 - Fake session files: `~/.pi/agent/sessions/--tmp-ai-agent--/fake-ui-{test,retry}.jsonl`,
   each containing one line `{"type":"session_info","name":"<display name>"}` so the
   sidebar picks a label. gio trash them when done (they pollute the real sidebar).
-- Run: `PI_GUI_PI_BIN=/tmp/ai-agent/fake-pi.py PI_GUI_DIRECT=1 GDK_BACKEND=broadway
-  BROADWAY_DISPLAY=:2 PI_GUI_OPEN_SESSION=<path>[;<path>…] target/release/pi-gui`
+- Run under **Xvfb** (broadway is abandoned — crashes, wedges, phantom slabs; don't
+  revisit): `Xvfb :66 -screen 0 1280x1000x24 &` then
+  `DISPLAY=:66 GDK_BACKEND=x11 PI_GUI_PI_BIN=/tmp/ai-agent/fake-pi.py
+  PI_GUI_DIRECT=1 PI_GUI_OPEN_SESSION=<path>[;<path>…] target/debug/pi-gui`
   (a `;`-separated list opens one tab per session — unknown paths are filtered out).
-- Verify: browser on http://127.0.0.1:8091 — **screenshots only, never click**.
-- **The GTK window is taller than the default 720px IAB viewport** — the bottom of
-  the transcript (last bubble, input box) falls below the browser fold and looks
-  missing. Call `tab.setViewportSize({width: 1280, height: 1000})` on the TAB (not
-  `tab.playwright.*`) BEFORE `goto`, and don't resize an already-rendered broadway
-  page — the resize wedges frame delivery (screenshot times out; restart required).
-- **broadway screen is 1024×768** — the window clamps to it regardless of
-  `default_width`; wide-window behavior can't be screenshotted directly. To verify
-  max-width logic, temporarily lower the cap (e.g. 560) so the insets show at
-  1024, then restore.
-- **Phantom slab**: a uniform slightly-darker rectangle in screenshots with NO
-  matching widget in a tree dump is a stale broadway canvas artifact (it survives
-  app restarts, correlates with nothing, disappears on a different display). Don't
-  chase it in the app — restart broadwayd on a fresh display (e.g. `:3` / port
-  8092) and re-screenshot.
-- **Widgets may render invisible inside broadway layers**: when a widget's
-  contents don't show, first dump the tree (names, classes, allocations, absolute
-  rects) and check whether the tree is correct before believing the screenshot;
-  the loud-background-color trick (temporary CSS class with red/green background)
+- Capture: `gm import -window root shot.png`; crop/zoom evidence with
+  `gm convert -crop WxH+X+Y +repage -resize 250% out.png`. Plain `import`, `magick`
+  and `compare` resolve to the ZCode AppImage's ImageMagick with NO X11 support.
+- **Xvfb does not repaint an idle UI** — a captured frame can be seconds stale
+  unless something animates (spinner) or events keep damaging the region. A widget
+  that "isn't rendered" in a shot may just live in a stale frame: re-shoot while a
+  spinner ticks before debugging the app. When a screenshot contradicts the widget
+  tree, dump the tree (names, classes, allocations, absolute rects) first; the
+  loud-background-color trick (temporary CSS class with red/green background)
   split "widget missing" from "render missing" in one run.
+- **The bottom band of the transcript viewport never paints on Xvfb** (last
+  ~16–20px): a caption on the LAST row is allocated+mapped but invisible. Fixed by
+  `margin_bottom(24)` on the transcript list plus `scroll_to_bottom_settled()`
+  (idle re-scrolls with a `queue_resize` guard against a stale
+  `vadjustment.upper`); don't remove either thinking the scroll "already happened".
+- **Transient states need scripted timing**: a temp `PI_GUI_AUTO_PROMPT` hook in
+  app.rs (set text at 30s → clear at 45s → send at 50s) plus a bash driver
+  (`/tmp/ai-agent/xvfb-verify.sh` pattern: absolute T0 offsets via `wait_until`,
+  `gm import` between them, hygiene block first). Delete the hook before commit.
+  fake-pi runs its scenario ONLY on `prompt` (~2s lead-in); `touch` a fresh empty
+  session file per run (e.g. `fake-ui-ttft.jsonl`) — gio trash test files when done.
 
 ### fake-pi.py spec (recreate if lost)
 
@@ -160,9 +187,10 @@ sidebar row, e.g. `.../current.jsonl` — otherwise startup renames + pre-activa
 row and clicking it short-circuits), `get_available_models`,
 `get_available_thinking_levels`, `get_messages`, `new_session`, `switch_session`,
 `set_session_name`, `set_model`, `set_thinking_level`, `abort`, `steer` — all
-`{"id","type":"response","command","success":true,...}`. On `switch_session`: store
-`sessionPath`, reply success, then run the scenario for that path in a thread. On
-`prompt`: reply, then run the success scenario. Event wire names: flat
+`{"id","type":"response","command","success":true,...}`. `switch_session` ONLY
+records the path and replies — auto-running the scenario there double-fired and
+poisoned evidence. On `prompt`: reply, then run the scenario for the current
+path. Event wire names: flat
 `{"type": "agent_start" | "agent_settled" | "message_update" | "tool_execution_*" |
 "auto_retry_start" | "auto_retry_end", ...}` with camelCase fields
 (`assistantMessageEvent`, `toolCallId`, `partialResult`, `errorMessage`, `finalError`).
@@ -172,22 +200,22 @@ row and clicking it short-circuits), `get_available_models`,
 - **GtkApplication is single-instance**: launching a second `pi-gui` does NOT start a
   new process — it activates the running one (new window + extra fake-pi child in the
   SAME process). Always kill the old instance by explicit PID before relaunching.
-- **killing the app crashes broadwayd** (GTK bug: `Gdk:ERROR broadway-output.c:458
-  assertion failed: (!reused_node->consumed)`), and a dying daemon kills the app.
-  Always restart daemon + app together; the browser tab then needs close + reopen.
-- **clicks wedge or crash broadway** non-deterministically (hover-only ghosts, input
-  eaten by zombie websockets from reloaded tabs, frame delivery stalls). Auto-open +
-  screenshot-only verification sidesteps all of it. If interaction is unavoidable:
-  exactly one tab, never reload it, move-then-click, and accept retries.
+- broadway is dead (crashes, wedges, stale canvas slabs) — every broadway-specific
+  workaround from earlier rounds was dropped; verify under Xvfb instead.
 - `pkill -f <pattern>` self-matches the sandbox wrapper's own argv (its cmdline
   contains your pattern) — kill by explicit PID from `ps -eo pid,cmd` instead, and
   filter self-matches with `rg -v "chrome|AppImage"`.
 - Stale checks: `kill -0 $(cat pidfile)` hits sandbox-mangled pids; verify by ps.
-- `magick` geometry args containing `+` (e.g. `-crop WxH+X+Y`) get mangled by the
-  sandbox — use python3/PIL for image crops.
-- broadway: single browser client; display `:N` → port 8080+(N−1) unless `-p`;
-  daemon arg `:N` creates socket `broadway{N+1}.socket`; client needs
-  `BROADWAY_DISPLAY=:N` matching the daemon arg.
+- `pkill`/`pgrep` here are ZCode AppImage shims (`pkill -9` → "invalid option");
+  kill wedged instances with `kill -9 <pid>` from the pgrep list. Every test
+  script starts with the hygiene block (pkill, sleep, kill -9 loop, abort if
+  still alive): a stray hours-old instance once ate a launch via single-instance
+  handoff and poisoned thread/pipe diagnostics.
+- yama `ptrace_scope=1` blocks gdb attach to non-descendants, and gdbserver is
+  unusable here (the env shim forks instead of execs so it tracks the wrong pid;
+  a direct spawn stops at ld.so entry). Don't burn time on it — temporary
+  `eprintln!` instrumentation + reading the app's stderr log is the effective
+  diagnostic.
 - GTK4: Button with both `label` and `icon_name` shows only the icon — compose a child
   Box (`icon_label_box()` in app.rs).
 - **GTK heights land late**: a widget appended this tick reports h=0 until a later
