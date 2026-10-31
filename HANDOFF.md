@@ -31,6 +31,16 @@ reasoning, tool cards), no web stack.
    scrolled window's `hadjustment::changed` (width changes re-measure). Replaces
    `propagate_natural_height`/`max_content_height`, which only grew after the
    card's internal scrollbar appeared.
+   **Compact chrome (second pass, user feedback)**: the first cut still rendered a
+   ~68px empty card. Two causes: generous chrome (TextView margins 11+11, card
+   padding 6+6 — now 6+6 and 4+4: ~40px empty, 73px at 3 lines, 190px capped) and
+   the real floor: with `vscrollbar_policy(Automatic)` a GtkScrolledWindow
+   RESERVES the scrollbar's ~58px minimum height even while idle (scratch probes:
+   an 18px label measures 58 inside Auto, its full natural inside Never). CSS fix
+   scoped to the composer: `.input-card scrollbar.vertical { min-height: 0 }` +
+   slider. Buttons capped at 30px so they don't re-floor the card. Also learned:
+   `Widget::measure` results INCLUDE the widget's CSS margins (the card measured
+   min 90 = content 30 + padding 8 + border 2 + margins 22).
 3. **TTFT + throughput** — `turn_started` stamped at send, `first_token_at` on the
    first thinking/text delta; TTFT = first token − send, rendered as "N.N s to
    first token" on the turn's FIRST message only (`has_header`). Throughput =

@@ -242,12 +242,33 @@ window {
     background-color: @card_bg_color;
     border: 1px solid alpha(@window_fg_color, 0.11);
     border-radius: 16px;
-    padding: 6px 6px 6px 4px;
+    /* One empty line should read as a compact bar: 4px card padding + the
+       TextView's 6px margins put ~11px of air above and below the text. */
+    padding: 4px 5px 4px 4px;
     margin: 6px 0 16px;
 }
 
 .input-card:focus-within {
     border-color: alpha(@accent_color, 0.55);
+}
+
+/* Circular defaults are 34px; at that size the buttons, not the text line,
+   set the card's floor height. */
+.input-card > button.circular {
+    min-width: 30px;
+    min-height: 30px;
+}
+
+/* With vscrollbar policy Automatic the scrolled window reserves the
+   scrollbar's ~58px minimum height even while idle, flooring the compact
+   card. Drop that reservation inside the composer; the scrollbar only has
+   anything to do once the text exceeds the 180px cap. */
+.input-card scrollbar.vertical {
+    min-height: 0;
+}
+
+.input-card scrollbar.vertical slider {
+    min-height: 0;
 }
 
 .input-textview {

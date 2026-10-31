@@ -408,8 +408,8 @@ impl PiWindow {
         let input_view = TextView::builder()
             .wrap_mode(gtk4::WrapMode::WordChar)
             .css_classes(["input-textview"])
-            .top_margin(11)
-            .bottom_margin(11)
+            .top_margin(6)
+            .bottom_margin(6)
             .build();
         let input_buffer = input_view.buffer();
 
@@ -455,7 +455,7 @@ impl PiWindow {
             .label("Ask pi to write, explain, or fix code…")
             .halign(Align::Start)
             .valign(Align::Start)
-            .margin_top(11)
+            .margin_top(6)
             .margin_start(2)
             .build();
         input_placeholder.add_css_class("input-placeholder");
